@@ -47,8 +47,9 @@ def_ruby '
 __clear_prev__ $$
 
 
+autoload -Uz add-zsh-hook
 
-preexec() {
+hist_preexec() {
 	local cmd
 	__first_cmd $1
 	cmd=$__first_cmd
@@ -68,13 +69,16 @@ preexec() {
 		rm -f "$ZLTMPD/idle"
 	fi
 }
-precmd() {
+add-zsh-hook preexec hist_preexec
+
+hist_precmd() {
 	precmd_called=1
 	on_reset_editor
 	echo -ne > "$ZLTMPD/idle"
 }
+add-zsh-hook precmd hist_precmd
 
-ST_hist=1 preexec
+ST_hist=1 hist_preexec
 ST_hist=0
 
 resu() {
