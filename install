@@ -2,6 +2,7 @@
 
 . $(dirname $0)/gyi
 
-depends zsh_rb yk_support_for_sh
+depends zsh_wrap yk_support_for_sh
 
 install zsh_dir_hist.zsh /etc/zshrc.d
+install zsh_acceptable

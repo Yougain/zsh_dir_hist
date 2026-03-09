@@ -1,11 +1,10 @@
 # for zsh
 
-require temp_path zsh_rb colors fpath prompt zed history
+require temp_path zsh_rb colors fpath prompt zed history zsh_wrap
 
 
 export ZLTMPD="$(temp_path zltmpd)"
 mkdir -p "$ZLTMPD"
-
 
 
 def_ruby '
@@ -122,23 +121,28 @@ get_cmd_from_hist_entry(){
 
 get_wd_from_hist_entry(){
 	local entry="$1"
-	local tmp="${entry##*;$CMD_MDATA_START }"
-	if [ ${#tmp} = ${#entry} ];then
+	local decoded
+	decoded="$(decode_suffix_from_hist_entry "$entry")"
+	if [ -z "$decoded" ]; then
 		echo -n ""
-	else
-		local wd="${tmp[1,$WD_IEND]}"
-		echo -n "$wd"
+		return
 	fi
+	local wd="${decoded%%$CMD_MDATA_SEP*}"
+	echo -n "$wd"
 }
 
 get_sid_from_hist_entry(){
 	local entry="$1"
-	local tmp="${entry##*;$CMD_MDATA_START }"
-	if [ ${#tmp} = ${#entry} ];then
+	local decoded
+	decoded="$(decode_suffix_from_hist_entry "$entry")"
+	if [ -z "$decoded" ]; then
 		echo -n ""
+		return
+	fi
+	if [[ "$decoded" == *"$CMD_MDATA_SEP"* ]]; then
+		echo -n "${decoded#*$CMD_MDATA_SEP}"
 	else
-		local sid="${entry[$SID_ISTART,$SID_IEND]}"
-		echo -n "$sid"
+		echo -n ""
 	fi
 }
 
@@ -532,7 +536,7 @@ def_ruby '
 				elsif carr[1] =~ /^\~\//
 					"find ~#{carr[1][1..-1].shellescape} " + Shellwords.shelljoin(carr[2..-1])
 				else
-					Shellwords.shelljoin
+					Shellwords.shelljoin(carr)
 				end
 			else
 				carr.shift
@@ -583,55 +587,12 @@ create_temp_file(){
 	echo -n "$tmpfile"
 }
 
-zle_acceptable(){
-	if ! zsh -n <<<"$1" 2>/dev/null; then
-		return 1
-	fi
-	return 0
-	local tmp_cmd_file=$(create_temp_file <<<"$1")
-	expect -c '
-	spawn zsh -n
-	set timeout 1
-	set fh [open "'$tmp_cmd_file'" r]
-	set last_line ""
-	while {[gets $fh line] >= 0} {
-		set last_line $line
-		send -- "$line\r"
-		expect {
-			-re {.*>} { set last_resp "prompt"; exp_continue }
-			"%" { set last_resp "percent"; exp_continue }
-			eof { break }
-			timeout { break }
-		}
-	}
-	close $fh
-
-	# 最後の行送信後のレスポンスで判定
-	if {[info exists last_resp]} {
-		set pid [pid]
-		if {$last_resp == "percent"} {
-			exec kill -9 $pid # exit code 137
-			exit 9
-		} elseif {$last_resp == "prompt"} {
-			exec kill -4 $pid # exit code 132
-			exit 4
-		}
-	}
-	exit 0
-	'
-	if [ $? -eq 132 ]; then
-		return 0
-	else
-		return 1
-	fi
-}
 
 ALL_BUFFER=
 
-CMD_MDATA_START="༄༅1"
-CMD_MDATA_END="༄༅2"
-CMD_WD_END="𖡄"
-CMD_SID_END="𖡅"
+CMD_MDATA_START="༄༅"
+CMD_MDATA_BYTE_PREFIX=";$CMD_MDATA_START "
+CMD_MDATA_SEP="𖡄"
 
 SID_IEND=$(( -1 - ${#CMD_MDATA_END} ))
 SID_ISTART=$(( SID_IEND - ${#SID} + 1))
@@ -642,7 +603,63 @@ $CMD_MDATA_START() { # 何もしない、前の結果を転送するだけ
 	return \$?
 }
 "
+if [ -z "$ZRB_FILTER_PID" ]; then
+	zrb_filter_on
+fi
 
+
+echo '
+	def gsub str, left
+		_left = nil
+		str.gsub! /#{CMD_MDATA_BYTE_PREFIX}[0-9a-fA-F]{2}/ do
+			""
+			_left = $'
+		end
+		if _left&.=~ /;(|CMD_MDATA_START(| (|[0-9a-fA-F]))$/
+			left.replace _left + left
+		end
+	end
+' > $ZRB_FILTER_DIR/erase_zsh_cmd_mdata.rb
+
+
+kill -s USR1 $ZRB_FILTER_PID 2>/dev/null
+
+
+encode_suffix(){
+	local src="$1"
+	if [ -z "$src" ]; then
+		echo -n ""
+		return
+	fi
+	print -rn -- "$src" \
+	| od -An -tx1 -v \
+	| tr -s ' ' '\n' \
+	| sed '/^$/d' \
+	| awk -v p=";$CMD_MDATA_START " '{printf "%s%s", p, toupper($1)}'
+}
+
+decode_suffix(){
+	local encoded="$1"
+	local prefix=";$CMD_MDATA_START "
+	local hex="${encoded//$prefix/}"
+	hex="$(print -rn -- "$hex" | tr -cd '0-9A-Fa-f')"
+	if [ -z "$hex" ]; then
+		echo -n ""
+		return
+	fi
+	print -rn -- "$hex" | xxd -r -p
+}
+
+decode_suffix_from_hist_entry(){
+	local entry="$1"
+	local prefix=";$CMD_MDATA_START "
+	if [[ "$entry" != *"$prefix"* ]]; then
+		echo -n ""
+		return
+	fi
+	local encoded="${entry#*"$prefix"}"
+	decode_suffix "$prefix$encoded"
+}
 
 
 
@@ -660,7 +677,7 @@ function _raw_cmd_line {
 	if zle_acceptable "$ALL_BUFFER"; then
 		BUFFER="${BUFFER%%[[:space:]]#}"   # 末尾の空白除去
 		export RAW_CMD_LINE="${ALL_BUFFER}"
-		cmd_suffix=";$CMD_MDATA_START $PWD$CMD_WD_END$SID$CMD_SID_END$CMD_MDATA_END"
+		cmd_suffix=$(encode_suffix "$PWD$CMD_MDATA_SEP$SID")
 		BUFFER="$BUFFER$cmd_suffix"
 	fi
 	echo -ne '\e7'
