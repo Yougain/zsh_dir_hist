@@ -1,6 +1,11 @@
 # for zsh
 
-require temp_path zsh_rb colors fpath prompt zed history zsh_wrap
+dbv
+require zsh_wrap
+dbv
+
+
+require temp_path zsh_rb colors fpath prompt zed history
 
 
 export ZLTMPD="$(temp_path zltmpd)"
@@ -291,7 +296,10 @@ reset_prompt() {
 
 
 h_set_cd(){
-	local meta_data=$(slice_meta_data_from_buffer)
+	dbv $BUFFER
+	local org_buff="$BUFFER"
+	BUFFER=$(remove_extra_data_from_buffer)
+	dbv $BUFFER
 	if [ "$HISTNO" = "$histno_prev" ]; then
 		return
 	fi
@@ -300,7 +308,7 @@ h_set_cd(){
 		hist_dir_arr=()
 		hist_dir_arr_idx=
 	fi
-	local d=$(get_wd_from_hist_entry "$meta_data")
+	local d=$(get_wd_from_hist_entry "$org_buff")
 	if [ -z "$d" ]; then
 		d="$CPWD"
 	fi
@@ -597,6 +605,8 @@ ALL_BUFFER=
 CMD_MDATA_START="༄༅"
 CMD_MDATA_BYTE_PREFIX=";$CMD_MDATA_START "
 CMD_MDATA_SEP="𖡄"
+CMD_SECRET="𖡄"
+CMD_SECRET_BYTE_PREFIX="$CMD_SECRET; "
 
 SID_IEND=$(( -1 - ${#CMD_MDATA_END} ))
 SID_ISTART=$(( SID_IEND - ${#SID} + 1))
@@ -606,28 +616,138 @@ eval "
 $CMD_MDATA_START() { # 何もしない、前の結果を転送するだけ
 	return \$?
 }
+$CMD_SECRET() { # 何もしない、前の結果を転送するだけ
+	return \$?
+}
 "
-if [ -z "$ZRB_FILTER_PID" ]; then
-	zrb_filter_on
+_correct_all_opt="${options[correct_all]}"
+_correct_opt="${options[correct]}"
+
+if [[ $_correct_all_opt == on ]]; then
+	unsetopt CORRECT_ALL
+	_correct_all_opt_cmd="setopt CORRECT_ALL"
+else
+	_correct_all_opt_cmd="unsetopt CORRECT_ALL"
+fi
+if [[ $_correct_opt == on ]]; then
+	unsetopt CORRECT
+	_correct_opt_cmd="setopt CORRECT"
+else
+	_correct_opt_cmd="unsetopt CORRECT"
 fi
 
 
 echo '
+	CMD_MDATA_BYTE_PREFIX = "'"$CMD_MDATA_BYTE_PREFIX"'".b
+	CMD_MDATA_BYTE_PREFIX_REGEX_STR = "".b
+	CMD_MDATA_BYTE_PREFIX.each_byte do |c|
+		CMD_MDATA_BYTE_PREFIX_REGEX_STR += format("\\\\x%02X".b, c)
+	end
+	CMD_MDATA_BYTE_PREFIX_REGEX = eval("/" + CMD_MDATA_BYTE_PREFIX_REGEX_STR + "[0-9a-fA-F]{2}/n")
+
+	CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR = "[0-9A-Fa-f]".b
+	CMD_MDATA_BYTE_PREFIX.reverse.each_byte do |c|
+		CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR.replace(
+			"#{format("\\\\x%02X", c)}(|#{CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR})"
+		)
+	end
+	CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX = eval("/" + CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR + "$/n")
+
+	CMD_SECRET_BYTE_PREFIX = "'"$CMD_SECRET_BYTE_PREFIX"'".b
+	CMD_SECRET_BYTE_PREFIX_REGEX_STR = "".b
+	CMD_SECRET_BYTE_PREFIX.each_byte do |c|
+		CMD_SECRET_BYTE_PREFIX_REGEX_STR += format("\\\\x%02X".b, c)
+	end
+	CMD_SECRET_BYTE_REGEX = eval("/" + CMD_SECRET_BYTE_PREFIX_REGEX_STR + ".+?;\\\\s+;\\\\s*/n")
+	CMD_SECRET_BYTE_PREFIX_REGEX = eval("/" + CMD_SECRET_BYTE_PREFIX_REGEX_STR + "/n")
+
+	CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR = CMD_SECRET_BYTE_PREFIX[-1].b
+	CMD_SECRET_BYTE_PREFIX[0...-1].reverse.each_byte do |c|
+		CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR.replace(
+			"#{format("\\\\x%02X", c)}(|#{CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR})"
+		)
+	end
+	CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR += "$".b
+
+
+	CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX = eval("/" + CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR + "/n")
+
+	STDERR.write "CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX = #{CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX.inspect}\\n"
+	STDERR.write "CMD_MDATA_BYTE_PREFIX_REGEX = #{CMD_MDATA_BYTE_PREFIX_REGEX.inspect}\\n"
+
+	STDERR.write "CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX = #{CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX.inspect}\\n"
+	STDERR.write "CMD_SECRET_BYTE_PREFIX_REGEX = #{CMD_SECRET_BYTE_PREFIX_REGEX.inspect}\\n"
+
 	def gsub str, left
-		_left = nil
-		str.gsub! /#{CMD_MDATA_BYTE_PREFIX}[0-9a-fA-F]{2}/ do
-			""
-			_left = $'
-		end
-		if _left&.=~ /;(|CMD_MDATA_START(| (|[0-9a-fA-F]))$/
-			left.replace _left + left
+	  	File.open("/tmp/test.zsh.log2", "ab") do |f|
+			if !str.empty?
+				f.write "-1 str = #{str.inspect}\\n"
+				f.write "0 left = #{left.inspect}\\n"
+				_left = nil
+				str.gsub! CMD_MDATA_BYTE_PREFIX_REGEX do
+					_left = $'"'"'
+					""
+				end
+				if _left
+					if _left =~ CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX
+						str.replace str + $`
+						left.replace $& + left
+					end
+				else
+					if str =~ CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX
+						str.replace $`
+						left.replace $& + left
+					end
+				end
+
+				f.write "-1 str = #{str.inspect}\\n"
+				f.write "0 left = #{left.inspect}\\n"
+				_left = nil
+				str.gsub! CMD_SECRET_BYTE_REGEX do
+					_left = $'"'"'
+					""
+				end
+				if _left
+					case _left
+					when CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX
+						str.replace str + $`
+						left.replace $& + left
+					when CMD_SECRET_BYTE_PREFIX_REGEX
+						str.replace str + $`
+						left.replace $& + left
+					end
+				else
+					case str
+					when CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX
+						str.replace $`
+						left.replace $& + left
+					when CMD_SECRET_BYTE_PREFIX_REGEX
+						str.replace $`
+						left.replace $& + left
+					end
+				end
+			elsif left == ";"
+				f.write "1 str = #{str.inspect}\\n"
+				f.write "2 left = #{left.inspect}\\n"
+				str.replace ";"
+				left.clear
+				f.write "3 str = #{str.inspect}\\n"
+				f.write "4 left = #{left.inspect}\\n"
+			elsif left =~ CMD_SECRET_BYTE_PREFIX_REGEX && $` == ""
+				f.write "1 str = #{str.inspect}\\n"
+				f.write "2 left = #{left.inspect}\\n"
+				str.replace $'"'"'.strip
+				left.clear
+			else
+				f.write "5 str = #{str.inspect}\\n"
+				f.write "6 left = #{left.inspect}\\n"
+			end
 		end
 	end
 ' > $ZRB_FILTER_DIR/erase_zsh_cmd_mdata.rb
 
-
-kill -s USR1 $ZRB_FILTER_PID 2>/dev/null
-
+dbv $ZRB_FILTER_DIR/erase_zsh_cmd_mdata.rb
+#実行してはいけない。実行するとデータが落ちる。kill -s USR1 $ZRB_FILTER_PID 2>/dev/null
 
 encode_suffix(){
 	local src="$1"
@@ -676,13 +796,23 @@ function _raw_cmd_line {
 			BUFFER=$raw_cmd_line
 		fi
 	fi	
+	local PRE_BUFFER=
+	if [ -z "$_zrb_filter_on" ]; then
+		PRE_BUFFER="$BUFFER"
+		_zrb_filter_on=1
+		dbv "turn on zrb_filter"
+		BUFFER="$CMD_SECRET_BYTE_PREFIX""zrb_filter_on; echo -en \"\e[28m\"; $_correct_all_opt_cmd; $_correct_opt_cmd; ;$BUFFER"
+	fi
 	ALL_BUFFER="$ALL_BUFFER$BUFFER
 "
 	if zle_acceptable "$ALL_BUFFER"; then
+		dbv "acceptable: $ALL_BUFFER"
 		BUFFER="${BUFFER%%[[:space:]]#}"   # 末尾の空白除去
 		export RAW_CMD_LINE="${ALL_BUFFER}"
 		cmd_suffix=$(encode_suffix "$PWD$CMD_MDATA_SEP$SID")
 		BUFFER="$BUFFER$cmd_suffix"
+	else
+		dbv "not acceptable: $ALL_BUFFER"
 	fi
 	echo -ne '\e7'
 	echo -ne "\033[999C"
@@ -694,13 +824,55 @@ function _raw_cmd_line {
 	echo -ne '\e8'
 	exec 1>&1
 	echo "`date +"%Y-%m-%d %H:%M:%S"` $ALL_BUFFER" >> $HOME/.zsh_raw_cmd_lines
+	if [ -n "$PRE_BUFFER" ]; then
+		echo -en "$PRE_BUFFER\e[8m"
+	fi
 	zle accept-line
 }
 
+remove_extra_data_from_buffer(){
+	local PRE_BUFFER="$BUFFER"
+	local cleaned_buffer="$BUFFER"
+	while [[ "$cleaned_buffer" == *"$CMD_SECRET_BYTE_PREFIX"*"; ;"* ]]; do
+		local left_part="${cleaned_buffer%%"$CMD_SECRET_BYTE_PREFIX"*}"
+		local rest_part="${cleaned_buffer#*"$CMD_SECRET_BYTE_PREFIX"}"
+		rest_part="${rest_part#*"; ;"}"
+		cleaned_buffer="${left_part}${rest_part}"
+	done
+	BUFFER="$cleaned_buffer"
+	dbv $BUFFER
+	dbv $CMD_MDATA_BYTE_PREFIX
+	dbv "${BUFFER%"$CMD_MDATA_BYTE_PREFIX"*}"
+	dbv "${BUFFER%%"$CMD_MDATA_BYTE_PREFIX"*}"
+	BUFFER="${BUFFER%%"$CMD_MDATA_BYTE_PREFIX"*}"
+	dbv $BUFFER
+	echo -n "$BUFFER"
+}
 
 zle -N raw_cmd_line_widget _raw_cmd_line
 bindkey '^J' raw_cmd_line_widget
 bindkey '^M' raw_cmd_line_widget
+
+# 例: 先頭スペース行は捨てる / " zrb_filter_on; " を除去して保存
+zrb_rewrite_history() {
+	emulate -L zsh
+	local line="${1%$'\n'}"   # 末尾改行を外す
+
+
+	[[ $options[histignorespace] == on ]] && [[ "$line" == ' '* ]] && return 1
+
+	if [[ $line == 𖡄*'; ;'* ]]; then
+		# 注入プレフィックスを取り除く
+  		line="${line#𖡄*'; ;'}"
+
+		# 元の登録を止め、書き換え後を履歴へ追加
+		print -sr -- "$line"
+		return 1
+  	fi
+  	return 0
+}
+
+add-zsh-hook zshaddhistory zrb_rewrite_history
 
 
 hist(){
