@@ -1,103 +1,25 @@
 # for zsh
 
-dbv
-require zsh_wrap
-dbv
+DEBUG=L
 
 
-require temp_path zsh_rb colors fpath prompt zed history
-
+require temp_path colors zsh_rb fpath prompt zed history
 
 export ZLTMPD="$(temp_path zltmpd)"
 mkdir -p "$ZLTMPD"
 
 
-def_ruby '
-	def __first_cmd c = nil
-		if !c
-			"__nocmd__"
-		else
-			data = c.strip
-			arr = data.split
-			progList = %W{vi vim ruby perl python supervise sv service sudo sh bash zsh rpm rpmbuild}
-			cmdl = []
-			arr.each do |e|
-				next if progList.include? File.basename(e)
-				next if e =~ /^\-/
-				cmdl.push File.basename(e)
-			end
-			if data =~ /^(scr|\/usr\/bin\/scr|resu|resudo)(\s|$)/
-				"__nocmd__"
-			else
-				cmdl.join(" ")
-			end
-		end
-	end
-'
-
-def_ruby '
-	def __clear_prev__ tmp
-		require "Yk/path_aux"
-		["cmd", "idle", "cmd-before"].each do |e|
-			"#{ENV['ZLTMPD']}/#{e}.*".glob.each do |f|
-				if f =~ /#{Regexp.escape e}.(\d+)/
-					if !"/proc/#{tmp.to_i}".exist?
-						f.unlink
-					end
-				end
-			end
-		end
-	end
-'
-__clear_prev__ $$
-
 
 autoload -Uz add-zsh-hook
 
-hist_preexec() {
-	local cmd
-	__first_cmd $1
-	cmd=$__first_cmd
-	if [ "$cmd" != "__nocmd__" ]; then
-		case $TERM in
-		xterm*)
-			echo -ne "\033]0;$cmd (${HOST%%.*}/`date +%H:%M:%S`)"; echo -ne "\007"
-		    ;;
-		screen)
-			echo -ne "\033_$cmd (${HOST%%.*}/`date +%H:%M:%S`)"; echo -ne "\033\\"
-		    ;;
-		esac
-		if [ -e "$ZLTMPD/cmd" ]; then
-			mv -f "$ZLTMPD/cmd" "$ZLTMPD/cmd-before"
-		fi
-		echo -ne $1 > "$ZLTMPD/cmd"
-		rm -f "$ZLTMPD/idle"
-	fi
-}
-add-zsh-hook preexec hist_preexec
 
 hist_precmd() {
+	up_key_pressed=
 	precmd_called=1
 	on_reset_editor
 	echo -ne > "$ZLTMPD/idle"
 }
 add-zsh-hook precmd hist_precmd
-
-ST_hist=1 hist_preexec
-ST_hist=0
-
-resu() {
-	/bin/su -c "if [ -e $ZLTMPD/cmd ]; then ( zsh -c 'cat $ZLTMPD/cmd;echo' >> ~/.zsh_history;zsh -l $ZLTMPD/cmd ); fi;exec zsh -l"
-}
-resudo() {
-	if [ -e "$ZLTMPD/cmd" ]; then
-		__sudo `cat "$ZLTMPD/cmd"`
-	fi
-}
-
-
-
-
 
 
 current_jiffies(){
@@ -122,17 +44,22 @@ remove_last_hist_entry(){
 	history -d $last_hno
 }
 
-get_cmd_from_hist_entry(){
+get_cmd(){
 	local entry="$1"
 	local cmd="${entry%;$CMD_MDATA_START *}"
 	echo -n "$cmd"
 }
 
-get_wd_from_hist_entry(){
+get_wd(){
 	local entry="$1"
 	local decoded
-	decoded="$(decode_suffix_from_hist_entry "$entry")"
+	decoded="$(get_suffix "$entry")"
 	if [ -z "$decoded" ]; then
+		echo -n ""
+		return
+	fi
+	deb $decoded
+	if [[ "$decoded" != *"$CMD_MDATA_SEP"* ]]; then
 		echo -n ""
 		return
 	fi
@@ -140,10 +67,10 @@ get_wd_from_hist_entry(){
 	echo -n "$wd"
 }
 
-get_sid_from_hist_entry(){
+get_sid(){
 	local entry="$1"
 	local decoded
-	decoded="$(decode_suffix_from_hist_entry "$entry")"
+	decoded="$(get_suffix "$entry")"
 	if [ -z "$decoded" ]; then
 		echo -n ""
 		return
@@ -162,7 +89,7 @@ on_prexec(){
 
 on_reset_editor(){ # called on precmd
 	local last_entry=$(last_hist_entry)
-	local last_cmd="$(get_cmd_from_hist_entry "$last_entry")"
+	local last_cmd="$(get_cmd "$last_entry")"
 
 	# Remove last history entry if it is empty command
 	if [ "$last_cmd" = "" ]; then
@@ -295,10 +222,14 @@ reset_prompt() {
 }
 
 
+hist_dir(){
+	get_wd "${history[$1]}"
+}
+
 h_set_cd(){
-	dbv $BUFFER
-	local org_buff="$BUFFER"
-	BUFFER=$(remove_extra_data_from_buffer)
+	dbv $HISTNO $BUFFER 
+	#local org_buff="$BUFFER"
+	remove_extra_data_from_buffer
 	dbv $BUFFER
 	if [ "$HISTNO" = "$histno_prev" ]; then
 		return
@@ -308,7 +239,11 @@ h_set_cd(){
 		hist_dir_arr=()
 		hist_dir_arr_idx=
 	fi
-	local d=$(get_wd_from_hist_entry "$org_buff")
+	#local d=$(get_wd "$org_buff")
+	d=$(hist_dir $HISTNO)
+	BUFFER="${history[$HISTNO]}"
+	remove_extra_data_from_buffer
+	dbv $d
 	if [ -z "$d" ]; then
 		d="$CPWD"
 	fi
@@ -340,6 +275,12 @@ h_set_cd(){
 	histno_prev=$HISTNO
 }
 
+h_resume_d(){
+	local cmd_suffix=$(create_suffix "$PWD$CMD_MDATA_SEP$SID")
+	BUFFER="$BUFFER$cmd_suffix"
+}
+
+
 function hook_interrupt() {
 	cd "$CPWD"
 	on_reset_editor
@@ -352,23 +293,34 @@ trap 'hook_interrupt' INT
 
 
 function history-beginning-search-backward-end-pwd(){
+	h_resume_d
 	zle .history-beginning-search-backward
 	h_set_cd
 }
 
 function history-beginning-search-forward-end-pwd(){
+	h_resume_d
 	zle .history-beginning-search-forward
 	h_set_cd
 }
 
+is_first_line() { [[ $LBUFFER != *$'\n'* ]]; }  # カーソルが1行目
+is_last_line()  { [[ $RBUFFER != *$'\n'* ]]; }  # カーソルが最終行
+
 
 function up-line-or-history-hook(){
+	is_first_line && h_resume_d
 	zle .up-line-or-history
+	if [ -z "$up_key_pressed" ]; then
+		up_key_pressed=1
+		HISTNO=$((HISTNO - 1))
+	fi
 	h_set_cd
 }
 
 
 function down-line-or-history-hook(){
+	is_last_line && h_resume_d
 	zle .down-line-or-history
 	h_set_cd
 }
@@ -377,11 +329,11 @@ hist_dir_arr=()
 hist_dir_arr_idx=
 orig_work_dir=
 typeset -A hist_dir_cache
-
+dbv
 
 hist-dir-only-left(){
 	local i=$HISTNO
-	local owd=$(hist_dir -n $i)
+	local owd=$(hist_dir $i)
 	if [ ${#hist_dir_arr[@]} -eq 0 ];then
 		hist_dir_arr_idx=1
 		if [ -n "$owd" ];then
@@ -392,7 +344,7 @@ hist-dir-only-left(){
 	fi
 	if (( ${#hist_dir_arr[@]} <= hist_dir_arr_idx ));then
 		while ((i > 0));do
-			local d=$(hist_dir -n $i)
+			local d=$(hist_dir $i)
 			if [ -n "$d" ] && [ "$d" != "$owd" ];then
 				for e in ${hist_dir_arr[@]};do
 					if [ "$e" = "$d" ];then
@@ -419,7 +371,7 @@ hist-dir-only-left(){
 }
 hist-dir-only-right(){
 	local i=$HISTNO
-	local owd=$(hist_dir -n $i)
+	local owd=$(hist_dir $i)
 	hist_last=$((`fc -l -1 | head -1 | awk '{print $1}'` + 1))
 	if [ ${#hist_dir_arr[@]} -eq 0 ];then
 		hist_dir_arr_idx=1
@@ -431,7 +383,7 @@ hist-dir-only-right(){
 	fi
 	if (( hist_dir_arr_idx == 1 ));then
 		while ((i <= hist_last));do
-			local d=$(hist_dir -n $i)
+			local d=$(hist_dir $i)
 			if [ -n "$d" ] && [ "$d" != "$owd" ];then
 				for e in ${hist_dir_arr[@]};do
 					if [ "$e" = "$d" ];then
@@ -465,37 +417,48 @@ zle -N hist-dir-only-right
 bindkey '^[[1;3C' hist-dir-only-right
 
 hist-dir-fix-up(){
+	h_resume_d
 	local i=$HISTNO
-	local owd=$(hist_dir $i)
+	local owd="$(hist_dir $i)"
+	if [ -z "$owd" ];then
+		owd="$PWD"
+	fi
 	i=$((i - 1))
+	d=
 	while ((i > 0));do
+		local d=
 		if [ -n "${history[$i]}" ]; then
-			local d=$(hist_dir $i)
+			d="$(hist_dir $i)"
 			if [ -n "$d" ] && [ "$d" = "$owd" ];then
-				HISTNO=$((i + 1))
-				zle .up-history
+				HISTNO=$i
+				BUFFER="${history[$HISTNO]}"
+				remove_extra_data_from_buffer
 				return
 			fi
 		fi
 		i=$((i - 1))
 	done
+	remove_extra_data_from_buffer
 }
 hist-dir-fix-down(){
+	h_resume_d
 	local i=$HISTNO
-	local owd=$(hist_dir $i)
+	local owd="$(hist_dir $i)"
 	i=$((i + 1))
 	hist_last=$((`fc -l -1 | head -1 | awk '{print $1}'` + 1))
 	while ((i <= hist_last));do
 		if [ -n "${history[$i]}" ]; then
-			local d=$(hist_dir $i)
+			local d="$(hist_dir $i)"
 			if [ -n "$d" ] && [ "$d" = "$owd" ];then
-				HISTNO=$((i - 1))
-				zle .down-history
+				HISTNO=$i
+				BUFFER="${history[$HISTNO]}"
+				remove_extra_data_from_buffer
 				return
 			fi
 		fi
 		i=$((i + 1))
 	done
+	remove_extra_data_from_buffer
 }
 
 zle -N hist-dir-fix-up
@@ -636,155 +599,19 @@ else
 	_correct_opt_cmd="unsetopt CORRECT"
 fi
 
-
-echo '
-	CMD_MDATA_BYTE_PREFIX = "'"$CMD_MDATA_BYTE_PREFIX"'".b
-	CMD_MDATA_BYTE_PREFIX_REGEX_STR = "".b
-	CMD_MDATA_BYTE_PREFIX.each_byte do |c|
-		CMD_MDATA_BYTE_PREFIX_REGEX_STR += format("\\\\x%02X".b, c)
-	end
-	CMD_MDATA_BYTE_PREFIX_REGEX = eval("/" + CMD_MDATA_BYTE_PREFIX_REGEX_STR + "[0-9a-fA-F]{2}/n")
-
-	CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR = "[0-9A-Fa-f]".b
-	CMD_MDATA_BYTE_PREFIX.reverse.each_byte do |c|
-		CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR.replace(
-			"#{format("\\\\x%02X", c)}(|#{CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR})"
-		)
-	end
-	CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX = eval("/" + CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX_STR + "$/n")
-
-	CMD_SECRET_BYTE_PREFIX = "'"$CMD_SECRET_BYTE_PREFIX"'".b
-	CMD_SECRET_BYTE_PREFIX_REGEX_STR = "".b
-	CMD_SECRET_BYTE_PREFIX.each_byte do |c|
-		CMD_SECRET_BYTE_PREFIX_REGEX_STR += format("\\\\x%02X".b, c)
-	end
-	CMD_SECRET_BYTE_REGEX = eval("/" + CMD_SECRET_BYTE_PREFIX_REGEX_STR + ".+?;\\\\s+;\\\\s*/n")
-	CMD_SECRET_BYTE_PREFIX_REGEX = eval("/" + CMD_SECRET_BYTE_PREFIX_REGEX_STR + "/n")
-
-	CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR = CMD_SECRET_BYTE_PREFIX[-1].b
-	CMD_SECRET_BYTE_PREFIX[0...-1].reverse.each_byte do |c|
-		CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR.replace(
-			"#{format("\\\\x%02X", c)}(|#{CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR})"
-		)
-	end
-	CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR += "$".b
-
-
-	CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX = eval("/" + CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX_STR + "/n")
-
-	STDERR.write "CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX = #{CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX.inspect}\\n"
-	STDERR.write "CMD_MDATA_BYTE_PREFIX_REGEX = #{CMD_MDATA_BYTE_PREFIX_REGEX.inspect}\\n"
-
-	STDERR.write "CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX = #{CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX.inspect}\\n"
-	STDERR.write "CMD_SECRET_BYTE_PREFIX_REGEX = #{CMD_SECRET_BYTE_PREFIX_REGEX.inspect}\\n"
-
-	def gsub str, left
-	  	File.open("/tmp/test.zsh.log2", "ab") do |f|
-			if !str.empty?
-				f.write "-1 str = #{str.inspect}\\n"
-				f.write "0 left = #{left.inspect}\\n"
-				_left = nil
-				str.gsub! CMD_MDATA_BYTE_PREFIX_REGEX do
-					_left = $'"'"'
-					""
-				end
-				if _left
-					if _left =~ CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX
-						str.replace str + $`
-						left.replace $& + left
-					end
-				else
-					if str =~ CMD_MDATA_BYTE_PREFIX_PARTIAL_REGEX
-						str.replace $`
-						left.replace $& + left
-					end
-				end
-
-				f.write "-1 str = #{str.inspect}\\n"
-				f.write "0 left = #{left.inspect}\\n"
-				_left = nil
-				str.gsub! CMD_SECRET_BYTE_REGEX do
-					_left = $'"'"'
-					""
-				end
-				if _left
-					case _left
-					when CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX
-						str.replace str + $`
-						left.replace $& + left
-					when CMD_SECRET_BYTE_PREFIX_REGEX
-						str.replace str + $`
-						left.replace $& + left
-					end
-				else
-					case str
-					when CMD_SECRET_BYTE_PREFIX_PARTIAL_REGEX
-						str.replace $`
-						left.replace $& + left
-					when CMD_SECRET_BYTE_PREFIX_REGEX
-						str.replace $`
-						left.replace $& + left
-					end
-				end
-			elsif left == ";"
-				f.write "1 str = #{str.inspect}\\n"
-				f.write "2 left = #{left.inspect}\\n"
-				str.replace ";"
-				left.clear
-				f.write "3 str = #{str.inspect}\\n"
-				f.write "4 left = #{left.inspect}\\n"
-			elsif left =~ CMD_SECRET_BYTE_PREFIX_REGEX && $` == ""
-				f.write "1 str = #{str.inspect}\\n"
-				f.write "2 left = #{left.inspect}\\n"
-				str.replace $'"'"'.strip
-				left.clear
-			else
-				f.write "5 str = #{str.inspect}\\n"
-				f.write "6 left = #{left.inspect}\\n"
-			end
-		end
-	end
-' > $ZRB_FILTER_DIR/erase_zsh_cmd_mdata.rb
-
-dbv $ZRB_FILTER_DIR/erase_zsh_cmd_mdata.rb
-#実行してはいけない。実行するとデータが落ちる。kill -s USR1 $ZRB_FILTER_PID 2>/dev/null
-
-encode_suffix(){
-	local src="$1"
-	if [ -z "$src" ]; then
-		echo -n ""
-		return
-	fi
-	print -rn -- "$src" \
-	| od -An -tx1 -v \
-	| tr -s ' ' '\n' \
-	| sed '/^$/d' \
-	| awk -v p=";$CMD_MDATA_START " '{printf "%s%s", p, toupper($1)}'
+create_suffix(){
+	echo -n ";$CMD_MDATA_START $1"
 }
-
-decode_suffix(){
-	local encoded="$1"
-	local prefix=";$CMD_MDATA_START "
-	local hex="${encoded//$prefix/}"
-	hex="$(print -rn -- "$hex" | tr -cd '0-9A-Fa-f')"
-	if [ -z "$hex" ]; then
-		echo -n ""
-		return
-	fi
-	print -rn -- "$hex" | xxd -r -p
-}
-
-decode_suffix_from_hist_entry(){
+get_suffix(){
 	local entry="$1"
 	local prefix=";$CMD_MDATA_START "
 	if [[ "$entry" != *"$prefix"* ]]; then
 		echo -n ""
 		return
 	fi
-	local encoded="${entry#*"$prefix"}"
-	decode_suffix "$prefix$encoded"
+	local data="${entry#*"$prefix"}"
+	echo -n "$data"
 }
-
 
 
 function _raw_cmd_line {
@@ -795,24 +622,6 @@ function _raw_cmd_line {
 		if [ -n "$raw_cmd_line" ]; then
 			BUFFER=$raw_cmd_line
 		fi
-	fi	
-	local PRE_BUFFER=
-	if [ -z "$_zrb_filter_on" ]; then
-		PRE_BUFFER="$BUFFER"
-		_zrb_filter_on=1
-		dbv "turn on zrb_filter"
-		BUFFER="$CMD_SECRET_BYTE_PREFIX""zrb_filter_on; echo -en \"\e[28m\"; $_correct_all_opt_cmd; $_correct_opt_cmd; ;$BUFFER"
-	fi
-	ALL_BUFFER="$ALL_BUFFER$BUFFER
-"
-	if zle_acceptable "$ALL_BUFFER"; then
-		dbv "acceptable: $ALL_BUFFER"
-		BUFFER="${BUFFER%%[[:space:]]#}"   # 末尾の空白除去
-		export RAW_CMD_LINE="${ALL_BUFFER}"
-		cmd_suffix=$(encode_suffix "$PWD$CMD_MDATA_SEP$SID")
-		BUFFER="$BUFFER$cmd_suffix"
-	else
-		dbv "not acceptable: $ALL_BUFFER"
 	fi
 	echo -ne '\e7'
 	echo -ne "\033[999C"
@@ -824,9 +633,6 @@ function _raw_cmd_line {
 	echo -ne '\e8'
 	exec 1>&1
 	echo "`date +"%Y-%m-%d %H:%M:%S"` $ALL_BUFFER" >> $HOME/.zsh_raw_cmd_lines
-	if [ -n "$PRE_BUFFER" ]; then
-		echo -en "$PRE_BUFFER\e[8m"
-	fi
 	zle accept-line
 }
 
@@ -846,7 +652,6 @@ remove_extra_data_from_buffer(){
 	dbv "${BUFFER%%"$CMD_MDATA_BYTE_PREFIX"*}"
 	BUFFER="${BUFFER%%"$CMD_MDATA_BYTE_PREFIX"*}"
 	dbv $BUFFER
-	echo -n "$BUFFER"
 }
 
 zle -N raw_cmd_line_widget _raw_cmd_line
@@ -857,19 +662,19 @@ bindkey '^M' raw_cmd_line_widget
 zrb_rewrite_history() {
 	emulate -L zsh
 	local line="${1%$'\n'}"   # 末尾改行を外す
-
+	local mod=
 
 	[[ $options[histignorespace] == on ]] && [[ "$line" == ' '* ]] && return 1
 
-	if [[ $line == 𖡄*'; ;'* ]]; then
-		# 注入プレフィックスを取り除く
-  		line="${line#𖡄*'; ;'}"
+	if [[ -z ${line//[[:space:]]/} ]]; then
+		return 0
+	fi
 
-		# 元の登録を止め、書き換え後を履歴へ追加
-		print -sr -- "$line"
-		return 1
-  	fi
-  	return 0
+	local cmd_suffix=$(create_suffix "$PWD$CMD_MDATA_SEP$SID")
+	line="$line$cmd_suffix"
+	# 元の登録を止め、書き換え後を履歴へ追加
+	print -sr -- "$line"
+	return 1
 }
 
 add-zsh-hook zshaddhistory zrb_rewrite_history
@@ -886,7 +691,7 @@ hist(){
 			asterisk=1
 		fi
 		if [[ $key =~ '^[0-9]+(\*|)$' ]]; then
-			dir=$(hist_dir -n $key)
+			dir=$(hist_dir $key)
 			kmax=$(( ${#key} > kmax ? ${#key} : kmax ))
 			dir=$(tilderize_path "$dir")
 			dmax=$(( ${#dir} > dmax ? ${#dir} : dmax ))
@@ -905,7 +710,7 @@ hist(){
 		fi
 		if [[ $key =~ '^[0-9]+(\*|)$' ]]; then
 			val="${line#*  }"
-			dir=$(hist_dir -n $key)
+			dir=$(hist_dir $key)
 			if [ -n "$dir" ]; then
 				lpadd=$(( kmax - ${#key} ))
 				lspaces=$(printf '%*s' "$lpadd" '')
@@ -935,6 +740,6 @@ hist(){
 }
 
 
-
+dbv
 
 
