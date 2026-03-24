@@ -9,14 +9,72 @@ export ZLTMPD="$(temp_path zltmpd)"
 mkdir -p "$ZLTMPD"
 
 
+setopt EXTENDED_HISTORY
 
 autoload -Uz add-zsh-hook
 
+typeset -A HISTNO2PWD HISTNO2SID
+typeset -A OtherPwdSameCmdNext OtherPwdSameCmdPrev OtherSidSameCmdNext OtherSidSameCmdPrev
+
+SCRIPT_DIR=${${(%):-%N}:A:h}
+def_ruby '
+	require "'$SCRIPT_DIR'/zsh_dir_hist_support"
+	def zsh_dir_hist_init pwd, sid, fc_path, src_path, info_path, hist_file
+		do_zsh_dir_hist_init pwd, sid, fc_path, src_path, info_path, hist_file
+	end
+	def zsh_dir_hist_update cpwd, epochseconds, prev_cmd
+		do_zsh_dir_hist_update cpwd, epochseconds, prev_cmd
+	end
+	def zsh_dir_hist_dir_msg histno
+		do_zsh_dir_hist_dir_msg histno
+	end
+'
+
+dir_hist_system_initialized=
+
+FC_PATH="$(temp_path zsh_history_fc)"
+SRC_PATH="$(temp_path zsh_history_src)"
+
+
+dir_hist_system_init(){
+	fc -l -t '%s' 1 > "$FC_PATH" 2>/dev/null
+	zsh_dir_hist_init "$PWD" "$SID" "$FC_PATH" "$SRC_PATH" "$ZSH_DIR_HIST_INTER_ZSH_INFO_DIR" "$HIST_FILE"
+	. $SRC_PATH
+	dir_hist_system_initialized=1
+}
+
+LAST_HIST_NO=0
+zmodload zsh/datetime
+
+update_local_and_pwd_hist_file(){
+
+	if [ -z "$dir_hist_system_initialized" ];then
+		dir_hist_system_init
+	else
+
+		if [ -z "$CPWD" ] || [ ! -d "$CPWD" ]; then
+			return
+		fi
+
+		fc -l -t '%s' "$LAST_HIST_NO" -1 > "$FC_PATH" 2>/dev/null
+		LAST_HIST_NO=$(tail -1 "$FC_PATH"|awk '{print $1}')
+		zsh_dir_hist_update "$CPWD" "$epochsec_to_history" "$cmd_to_history"
+		epochsec_to_history=
+		cmd_to_history=
+		. $SRC_PATH
+	fi
+}
+
 
 hist_precmd() {
+	if [ -z "$CPWD" ];then
+		CPWD=$PWD
+	fi
 	up_key_pressed=
 	precmd_called=1
 	on_reset_editor
+	update_local_and_pwd_hist_file
+	zdh_update_links_on_precmd
 	echo -ne > "$ZLTMPD/idle"
 }
 add-zsh-hook precmd hist_precmd
@@ -35,6 +93,10 @@ session_id(){
 
 SID=$(session_id)
 
+ZSH_DIR_HIST_INTER_ZSH_INFO_DIR=$(temp_ipc_path dir_hist)
+mkdir -p "$ZSH_DIR_HIST_INTER_ZSH_INFO_DIR"
+
+
 last_hist_entry(){
 	fc -l -1 -1 | sed -E 's/^[[:space:]]*[0-9]+\*?[[:space:]]+//'
 }
@@ -44,60 +106,22 @@ remove_last_hist_entry(){
 	history -d $last_hno
 }
 
-get_cmd(){
-	local entry="$1"
-	local cmd="${entry%;$CMD_MDATA_START *}"
-	echo -n "$cmd"
-}
-
-get_wd(){
-	local entry="$1"
-	local decoded
-	decoded="$(get_suffix "$entry")"
-	if [ -z "$decoded" ]; then
-		echo -n ""
-		return
-	fi
-	deb $decoded
-	if [[ "$decoded" != *"$CMD_MDATA_SEP"* ]]; then
-		echo -n ""
-		return
-	fi
-	local wd="${decoded%%$CMD_MDATA_SEP*}"
-	echo -n "$wd"
-}
-
-get_sid(){
-	local entry="$1"
-	local decoded
-	decoded="$(get_suffix "$entry")"
-	if [ -z "$decoded" ]; then
-		echo -n ""
-		return
-	fi
-	if [[ "$decoded" == *"$CMD_MDATA_SEP"* ]]; then
-		echo -n "${decoded#*$CMD_MDATA_SEP}"
-	else
-		echo -n ""
-	fi
-}
-
 on_prexec(){
 	# no need to remove duplicated entries here because of setopt hist_ignore_dups
+	CPWD=$PWD
 }
 
 
 on_reset_editor(){ # called on precmd
 	local last_entry=$(last_hist_entry)
-	local last_cmd="$(get_cmd "$last_entry")"
 
 	# Remove last history entry if it is empty command
-	if [ "$last_cmd" = "" ]; then
+	if [ "$last_entry" = "" ]; then
 		remove_last_hist_entry
 	fi
 
-	CPWD=$PWD
 	hist_dir_arr=()
+	hist_dir_histno_arr=()
 	hist_dir_arr_idx=
 	orig_work_dir=
 	zsh_d_size_max=
@@ -173,6 +197,17 @@ reset_space(){
 	post_space=$(getSpaces $((prompt_post_sz - 1)))
 }
 
+reset_space2(){
+	prompt_before_embodyment2=$(getEmbodymentString $PROMPT_before)
+	prompt_pre_sz2=$((${#prompt_before_embodyment2} - pwd_tilda_size))
+	local prompt_after_embodyment2=$(getEmbodymentString $PROMPT_after)
+	local prompt_post_sz2=${#prompt_after_embodyment2}
+	ocaption2="$2 "
+	pre_space2="$ocaption2$(getSpaces $((prompt_pre_sz2 - 1 - ${#ocaption2})))"
+	post_space2=$(getSpaces $((prompt_post_sz2 - 1)))
+}
+
+
 
 reset_space
 
@@ -184,8 +219,11 @@ reset_prompt() {
 	fi
 	local szm="$zsh_d_size_max"
 	local orgPwd="$1"
+	local targetPwd="$2"
+	local msg="$3"
 	local sz=$(tilda_size "$PWD")
-	local osz
+	local osz=
+	local osz2=
 	local padd=0
 	local spaces=""
 	local pre_prompt=""
@@ -193,7 +231,14 @@ reset_prompt() {
 		orgPwd=$(tilderize_path "$orgPwd")
 		osz=${#orgPwd}
 	fi
-	zsh_d_size_max=$(max_multi "$sz" "$osz" "$szm")
+	if [ -n "$msg" ]; then
+		reset_space2 "$msg"
+		if [ -n "$targetPwd" ] ;then
+			targetPwd=$(tilderize_path "$targetPwd")
+			osz2=${#targetPwd}
+		fi
+	fi
+	zsh_d_size_max=$(max_multi "$sz" "$osz" "$szm" "$osz2")
 	szm="$zsh_d_size_max"
 	padd=$((szm - sz))
 	spaces=$(getSpaces "$padd")
@@ -203,6 +248,14 @@ reset_prompt() {
 		local ospaces=$(getSpaces "$opadd")
 		pre_prompt="(${pre_space}%F{magenta}${orgPwd}${ospaces}%f)${post_space}
 "
+	fi
+	if [ -n "$msg" ]; then
+		if [ -n "$targetPwd" ] ;then
+			local opadd2=$((szm - osz2))
+			local ospaces2=$(getSpaces "$opadd2")
+			pre_prompt="${pre_prompt}(${pre_space2}%F{yellow}${targetPwd}${ospaces2}%f)${post_space2}
+"
+		fi
 	fi
 	PROMPT="${pre_prompt}${nprompt}"
 	if [ -z "$no_zle" ];then
@@ -223,13 +276,16 @@ reset_prompt() {
 
 
 hist_dir(){
-	get_wd "${history[$1]}"
+	local d="${histno_to_id_path[$1]}"
+	if [ -n "${d#${d%%/*}}" ]; then
+		echo -n "$d"
+	else
+		echo -n "$PWD"
+	fi
 }
 
 h_set_cd(){
 	dbv $HISTNO $BUFFER 
-	#local org_buff="$BUFFER"
-	remove_extra_data_from_buffer
 	dbv $BUFFER
 	if [ "$HISTNO" = "$histno_prev" ]; then
 		return
@@ -237,12 +293,11 @@ h_set_cd(){
 	if [ -z "$CPWD" ];then
 		CPWD=$PWD
 		hist_dir_arr=()
+		hist_dir_histno_arr=()
 		hist_dir_arr_idx=
 	fi
 	#local d=$(get_wd "$org_buff")
 	d=$(hist_dir $HISTNO)
-	BUFFER="${history[$HISTNO]}"
-	remove_extra_data_from_buffer
 	dbv $d
 	if [ -z "$d" ]; then
 		d="$CPWD"
@@ -251,34 +306,34 @@ h_set_cd(){
 	if [ -n "$d" ];then
 		if [ "$d" != "$PWD" ];then
 			pwd="$(print -P %~)"
-			cd "$d"
-			d="$(tilderize_path "$d")"
-			if [ -n "$zsh_d_size_max" ]; then
-				if ((zsh_d_size_max < ${#d})); then
-					x=3
-				 	zsh_d_size_max=${#d}
-				elif ((zsh_d_size_max < ${#pwd})); then
-					x=4
+			if [ -d "$d" -a -x "$d" ]; then
+				cd "$d"
+				d="$(tilderize_path "$d")"
+				if [ -n "$zsh_d_size_max" ]; then
+					if ((zsh_d_size_max < ${#d})); then
+						x=3
+						zsh_d_size_max=${#d}
+					elif ((zsh_d_size_max < ${#pwd})); then
+						x=4
+						zsh_d_size_max=${#pwd}
+					fi
+				elif ((#d > #pwd)); then
+					x=1
+					zsh_d_size_max=${#d}
+				else
+					x=2
 					zsh_d_size_max=${#pwd}
 				fi
-			elif ((#d > #pwd)); then
-				x=1
-				zsh_d_size_max=${#d}
+				echo "x=$x #d=${#d} > #pwd=${#pwd} cd from '$pwd' to '$d' from history : $HISTNO : $BUFFER zsh_d_size_max=$zsh_d_size_max" >> $HOME/.zsh_cd_history
+				reset_prompt
 			else
-				x=2
-				zsh_d_size_max=${#pwd}
+				reset_prompt "" "$d"
 			fi
-			echo "x=$x #d=${#d} > #pwd=${#pwd} cd from '$pwd' to '$d' from history : $HISTNO : $BUFFER zsh_d_size_max=$zsh_d_size_max" >> $HOME/.zsh_cd_history
-			reset_prompt
 		fi
 	fi
 	histno_prev=$HISTNO
 }
 
-h_resume_d(){
-	local cmd_suffix=$(create_suffix "$PWD$CMD_MDATA_SEP$SID")
-	BUFFER="$BUFFER$cmd_suffix"
-}
 
 
 function hook_interrupt() {
@@ -293,13 +348,11 @@ trap 'hook_interrupt' INT
 
 
 function history-beginning-search-backward-end-pwd(){
-	h_resume_d
 	zle .history-beginning-search-backward
 	h_set_cd
 }
 
 function history-beginning-search-forward-end-pwd(){
-	h_resume_d
 	zle .history-beginning-search-forward
 	h_set_cd
 }
@@ -309,7 +362,6 @@ is_last_line()  { [[ $RBUFFER != *$'\n'* ]]; }  # カーソルが最終行
 
 
 function up-line-or-history-hook(){
-	is_first_line && h_resume_d
 	zle .up-line-or-history
 	if [ -z "$up_key_pressed" ]; then
 		up_key_pressed=1
@@ -320,16 +372,14 @@ function up-line-or-history-hook(){
 
 
 function down-line-or-history-hook(){
-	is_last_line && h_resume_d
 	zle .down-line-or-history
 	h_set_cd
 }
 
 hist_dir_arr=()
 hist_dir_arr_idx=
+hist_dir_histno_arr=()
 orig_work_dir=
-typeset -A hist_dir_cache
-dbv
 
 hist-dir-only-left(){
 	local i=$HISTNO
@@ -341,6 +391,7 @@ hist-dir-only-left(){
 		else
 			hist_dir_arr+=("$PWD")
 		fi
+		hist_dir_histno_arr+=("$i")
 	fi
 	if (( ${#hist_dir_arr[@]} <= hist_dir_arr_idx ));then
 		while ((i > 0));do
@@ -348,27 +399,44 @@ hist-dir-only-left(){
 			if [ -n "$d" ] && [ "$d" != "$owd" ];then
 				for e in ${hist_dir_arr[@]};do
 					if [ "$e" = "$d" ];then
-						i=$((i - 1))
+						i=${other_id_path_prev[$i]}
+						if [ -z "$i" ]; then
+							break 2
+						fi
 						continue 2
 					fi
 				done
 				hist_dir_arr+=("$d")
+				hist_dir_histno_arr+=("$i")
 				hist_dir_arr_idx=${#hist_dir_arr[@]}
-				cd "$d"
-				echo "cd to '$d' from history : $i" >> $HOME/.zsh_cd_history
-				reset_prompt "$owd"
+				if [ -d "$d" -a -x "$d" ]; then
+					cd "$d"
+					echo "cd to '$d' from history : $i" >> $HOME/.zsh_cd_history
+					reset_prompt "$owd"
+				else
+					reset_prompt "$owd" "$d"
+				fi
 				return
 			fi
-			i=$((i - 1))
+			i="${other_id_path_prev[$i]}"
+			if [ -z "$i" ]; then
+				break
+			fi
 		done
 	else
 		hist_dir_arr_idx=$((hist_dir_arr_idx + 1))
 		local d="${hist_dir_arr[$hist_dir_arr_idx]}"
-		cd "$d"
-		echo "cd to '$d' from hist_dir_arr : $hist_dir_arr_idx" >> $HOME/.zsh_cd_history
-		reset_prompt "$owd"
+		if [ -d "$d" -a -x "$d" ]; then
+			cd "$d"
+			echo "cd to '$d' from hist_dir_arr : $hist_dir_arr_idx" >> $HOME/.zsh_cd_history
+			reset_prompt "$owd"
+		else
+			reset_prompt "$owd" "$d"
+		fi
 	fi
+
 }
+
 hist-dir-only-right(){
 	local i=$HISTNO
 	local owd=$(hist_dir $i)
@@ -380,6 +448,7 @@ hist-dir-only-right(){
 		else
 			hist_dir_arr+=("$PWD")
 		fi
+		hist_dir_histno_arr+=("$i")
 	fi
 	if (( hist_dir_arr_idx == 1 ));then
 		while ((i <= hist_last));do
@@ -387,25 +456,40 @@ hist-dir-only-right(){
 			if [ -n "$d" ] && [ "$d" != "$owd" ];then
 				for e in ${hist_dir_arr[@]};do
 					if [ "$e" = "$d" ];then
-						i=$((i + 1))
+						i=${other_id_path_next[$i]}
+						if [ -z "$i" ]; then
+							break 2
+						fi
 						continue 2
 					fi
 				done
 				hist_dir_arr=("$d" ${hist_dir_arr[@]})
+				hist_dir_histno_arr=("$i" ${hist_dir_histno_arr[@]})
 				hist_dir_arr_idx=1
-				cd "$d"
-				echo "cd to '$d' from history : $i" >> $HOME/.zsh_cd_history
-				reset_prompt "$owd"
+				if [ -d "$d" -a -x "$d" ]; then
+					cd "$d"
+					echo "cd to '$d' from history : $i" >> $HOME/.zsh_cd_history
+					reset_prompt "$owd"
+				else
+					reset_prompt "$owd" "$d"
+				fi
 				return
 			fi
-			i=$((i + 1))
+			i="${other_id_path_next[$i]}"
+			if [ -z "$i" ]; then
+				break
+			fi
 		done
 	elif (( hist_dir_arr_idx > 1 ));then
 		hist_dir_arr_idx=$((hist_dir_arr_idx - 1))
 		local d="${hist_dir_arr[$hist_dir_arr_idx]}"
-		cd "$d"
-		echo "cd to '$d' from hist_dir_arr : $hist_dir_arr_idx (${hist_dir_arr[$hist_dir_arr_idx]})" >> $HOME/.zsh_cd_history
-		reset_prompt "$owd"
+		if [ -d "$d" -a -x "$d" ]; then
+			cd "$d"
+			echo "cd to '$d' from hist_dir_arr : $hist_dir_arr_idx (${hist_dir_arr[$hist_dir_arr_idx]})" >> $HOME/.zsh_cd_history
+			reset_prompt "$owd"
+		else
+			reset_prompt "$owd" "$d"
+		fi
 	fi
 }
 
@@ -471,6 +555,52 @@ zle -N history-beginning-search-forward-end history-beginning-search-forward-end
 zle -N up-line-or-history up-line-or-history-hook
 zle -N down-line-or-history down-line-or-history-hook
 
+beginning-of-history-hook() {
+  	emulate -L zsh
+  	h_resume_d
+  	zle .beginning-of-history   # 元の動作
+  	h_set_cd
+}
+
+zle -N beginning-of-history beginning-of-history-hook
+
+end-of-history-hook() {
+  	emulate -L zsh
+  	h_resume_d
+  	zle .end-of-history   # 元の動作
+  	h_set_cd
+}
+
+zle -N end-of-history end-of-history-hook
+
+setopt EXTENDED_GLOB
+
+expand-history-hook() {
+	emulate -L zsh
+	local before="$BUFFER"
+
+	zle .expand-history   # 元の展開を実行
+
+	local pat=$';༄༅ [^𖡄]#𖡄[0-9](#c20)'
+	BUFFER="${BUFFER//$~pat/}"
+}
+
+zle -N expand-history expand-history-hook
+
+accept-line-and-down-history-hook() {
+  emulate -L zsh
+  local src="$BUFFER"
+
+  if zle_acceptable "$src"; then
+    # 完成構文: ここで加工や付加情報を入れてから本来動作
+    zle .accept-line-and-down-history
+	h_set_cd
+  else
+    # 未完成構文: 継続入力側へ
+    zle .accept-line
+  fi
+}
+zle -N accept-line-and-down-history accept-line-and-down-history-hook
 
 def_ruby '
 	require "shellwords"
@@ -623,6 +753,15 @@ function _raw_cmd_line {
 			BUFFER=$raw_cmd_line
 		fi
 	fi
+	ALL_BUFFER="$ALL_BUFFER
+$BUFFER"
+	if zle_acceptable "$ALL_BUFFER"; then
+		# 完成構文: ここで加工や付加情報を入れてから本来動作
+		BUFFER="$ALL_BUFFER"
+	else
+		# 未完成構文: 継続入力側へ
+		BUFFER="$ALL_BUFFER"
+	fi
 	echo -ne '\e7'
 	echo -ne "\033[999C"
 	echo -ne "\033[8D"
@@ -658,26 +797,24 @@ zle -N raw_cmd_line_widget _raw_cmd_line
 bindkey '^J' raw_cmd_line_widget
 bindkey '^M' raw_cmd_line_widget
 
+
+
+
 # 例: 先頭スペース行は捨てる / " zrb_filter_on; " を除去して保存
-zrb_rewrite_history() {
+zsh_history_hook() {
 	emulate -L zsh
 	local line="${1%$'\n'}"   # 末尾改行を外す
-	local mod=
 
 	[[ $options[histignorespace] == on ]] && [[ "$line" == ' '* ]] && return 1
 
 	if [[ -z ${line//[[:space:]]/} ]]; then
+		cmd_to_history="$line"
+		epochsec_to_history="$EPOCHSECONDS"
 		return 0
 	fi
-
-	local cmd_suffix=$(create_suffix "$PWD$CMD_MDATA_SEP$SID")
-	line="$line$cmd_suffix"
-	# 元の登録を止め、書き換え後を履歴へ追加
-	print -sr -- "$line"
-	return 1
 }
 
-add-zsh-hook zshaddhistory zrb_rewrite_history
+add-zsh-hook zshaddhistory zsh_history_hook
 
 
 hist(){
