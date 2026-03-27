@@ -2,6 +2,17 @@
 
 DEBUG=L
 
+FIX_DIR_KEY=alt
+FIX_DIR_KEY=
+
+if [ -n "$FIX_DIR_KEY" ]; then # alt key is used for moving cursor without changing directory
+	no_alt_gl="global"
+	alt_gl="local"
+else
+	no_alt_gl="local"
+	alt_gl="global"
+fi
+
 
 require temp_path colors zsh_rb fpath prompt zed history
 
@@ -22,11 +33,32 @@ def_ruby '
 	def zsh_dir_hist_init pwd, sid, fc_path, src_path, info_path, hist_file
 		do_zsh_dir_hist_init pwd, sid, fc_path, src_path, info_path, hist_file
 	end
-	def zsh_dir_hist_update cpwd, epochseconds, prev_cmd
-		do_zsh_dir_hist_update cpwd, epochseconds, prev_cmd
+	def zsh_dir_hist_update cpwd, epochseconds, prev_cmd, new_histno
+		do_zsh_dir_hist_update cpwd, epochseconds, prev_cmd, new_histno
 	end
 	def zsh_dir_hist_dir_msg histno
 		do_zsh_dir_hist_dir_msg histno
+	end
+	def get_id_path_from_dir dir
+		do_get_id_path_from_dir dir
+	end
+	def histno_to_id_path histno
+		do_histno_to_id_path histno
+	end
+	def _get_bind_keyseq_for widget
+		do_get_bind_keyseq_for widget
+	end
+	def initialize_bindkey_data bindkey_path
+		do_initialize_bindkey_data bindkey_path
+	end
+	def _alt_keyseq *keyseq
+		do_alt_keyseq *keyseq
+	end
+	def _keyseq keyname
+		do_keyseq keyname
+	end
+	def _keyname keyseq
+		do_keyname keyseq
 	end
 '
 
@@ -34,11 +66,12 @@ dir_hist_system_initialized=
 
 FC_PATH="$(temp_path zsh_history_fc)"
 SRC_PATH="$(temp_path zsh_history_src)"
+BINDKEY_PATH="$(temp_path zsh_history_bindkey)"
 
 
 dir_hist_system_init(){
 	fc -l -t '%s' 1 > "$FC_PATH" 2>/dev/null
-	zsh_dir_hist_init "$PWD" "$SID" "$FC_PATH" "$SRC_PATH" "$ZSH_DIR_HIST_INTER_ZSH_INFO_DIR" "$HIST_FILE"
+	zsh_dir_hist_init "$CPWD" "$SID" "$FC_PATH" "$SRC_PATH" "$ZSH_DIR_HIST_INTER_ZSH_INFO_DIR" "$HIST_FILE" "$HISTNO"
 	. $SRC_PATH
 	dir_hist_system_initialized=1
 }
@@ -58,7 +91,7 @@ update_local_and_pwd_hist_file(){
 
 		fc -l -t '%s' "$LAST_HIST_NO" -1 > "$FC_PATH" 2>/dev/null
 		LAST_HIST_NO=$(tail -1 "$FC_PATH"|awk '{print $1}')
-		zsh_dir_hist_update "$CPWD" "$epochsec_to_history" "$cmd_to_history"
+		zsh_dir_hist_update "$CPWD" "$epochsec_to_history" "$cmd_to_history" "$HISTNO"
 		epochsec_to_history=
 		cmd_to_history=
 		. $SRC_PATH
@@ -119,11 +152,13 @@ on_reset_editor(){ # called on precmd
 	if [ "$last_entry" = "" ]; then
 		remove_last_hist_entry
 	fi
-
-	hist_dir_arr=()
-	hist_dir_histno_arr=()
-	hist_dir_arr_idx=
-	orig_work_dir=
+	if [ -n "$FOR_HIST_CD_IN_PRECMD" ]; then
+		HISTNO=${FOR_HIST_CD_IN_PRECMD%% *}
+		local direction=${FOR_HIST_CD_IN_PRECMD#* }
+		unset FOR_HIST_CD_IN_PRECMD
+		hist_cd "$direction"
+	fi
+	hist_dir_arr_reset
 	zsh_d_size_max=
 	ALL_BUFFER=
 	if [ -n "$interrupted" -o "$is_nullbuff" ]; then
@@ -275,16 +310,17 @@ reset_prompt() {
 }
 
 
-hist_dir(){
-	local d="${histno_to_id_path[$1]}"
-	if [ -n "${d#${d%%/*}}" ]; then
-		echo -n "$d"
+hist_id_path(){
+	local id_path="${histno_to_id_path[$1]}"
+	if [ -n "$id_path" ]; then
+		echo -n "$id_path"
 	else
-		echo -n "$PWD"
+		get_id_path_from_dir "$PWD"
+		echo -n "$get_id_path_from_dir"
 	fi
 }
 
-h_set_cd(){
+hist_cd(){
 	dbv $HISTNO $BUFFER 
 	dbv $BUFFER
 	if [ "$HISTNO" = "$histno_prev" ]; then
@@ -292,12 +328,16 @@ h_set_cd(){
 	fi
 	if [ -z "$CPWD" ];then
 		CPWD=$PWD
-		hist_dir_arr=()
-		hist_dir_histno_arr=()
-		hist_dir_arr_idx=
+		hist_dir_arr_reset
 	fi
 	#local d=$(get_wd "$org_buff")
-	d=$(hist_dir $HISTNO)
+	local id_path=
+	if [ "$1" = "forward" ]; then
+		id_path=${histno_to_proxy_for_id_path_in_forward[$HISTNO]}
+	else
+		id_path=${histno_to_proxy_for_id_path_in_backward[$HISTNO]}
+	fi
+	d="$(id_path_to_dir "$id_path")"
 	dbv $d
 	if [ -z "$d" ]; then
 		d="$CPWD"
@@ -347,260 +387,284 @@ bindkey '^C' hook_interrupt
 trap 'hook_interrupt' INT
 
 
-function history-beginning-search-backward-end-pwd(){
-	zle .history-beginning-search-backward
-	h_set_cd
-}
-
-function history-beginning-search-forward-end-pwd(){
-	zle .history-beginning-search-forward
-	h_set_cd
-}
 
 is_first_line() { [[ $LBUFFER != *$'\n'* ]]; }  # カーソルが1行目
 is_last_line()  { [[ $RBUFFER != *$'\n'* ]]; }  # カーソルが最終行
 
 
-function up-line-or-history-hook(){
-	zle .up-line-or-history
-	if [ -z "$up_key_pressed" ]; then
-		up_key_pressed=1
-		HISTNO=$((HISTNO - 1))
-	fi
-	h_set_cd
+hist_dir_arr_reset(){
+	hist_dir_arr=()
+	hist_dir_arr_idx=
+	hist_dir_histno_arr=()
 }
 
-
-function down-line-or-history-hook(){
-	zle .down-line-or-history
-	h_set_cd
+id_path_to_dir(){
+	local id_path="$1"
+	echo -n "${id_path#${id_path%%/*}}"
 }
 
-hist_dir_arr=()
-hist_dir_arr_idx=
-hist_dir_histno_arr=()
-orig_work_dir=
-
-hist-dir-only-left(){
-	local i=$HISTNO
-	local owd=$(hist_dir $i)
-	if [ ${#hist_dir_arr[@]} -eq 0 ];then
-		hist_dir_arr_idx=1
-		if [ -n "$owd" ];then
-			hist_dir_arr+=("$owd")
-		else
-			hist_dir_arr+=("$PWD")
+hist-dir-only-cd(){
+	d="$(id_path_to_dir "$id_path")"
+	owd="$(id_path_to_dir "$owd_id_path")"
+	if [ -d "$d" -a -x "$d" ]; then
+		cd "$d" 2>/denv/null
+		if [ "$PWD" = "$d" ]; then
+			echo "cd to '$d' from $1" >> $HOME/.zsh_cd_history
+			reset_prompt "$owd"
+			return
 		fi
-		hist_dir_histno_arr+=("$i")
 	fi
-	if (( ${#hist_dir_arr[@]} <= hist_dir_arr_idx ));then
-		while ((i > 0));do
-			local d=$(hist_dir $i)
-			if [ -n "$d" ] && [ "$d" != "$owd" ];then
-				for e in ${hist_dir_arr[@]};do
-					if [ "$e" = "$d" ];then
-						i=${other_id_path_prev[$i]}
-						if [ -z "$i" ]; then
-							break 2
-						fi
-						continue 2
-					fi
-				done
-				hist_dir_arr+=("$d")
-				hist_dir_histno_arr+=("$i")
-				hist_dir_arr_idx=${#hist_dir_arr[@]}
-				if [ -d "$d" -a -x "$d" ]; then
-					cd "$d"
-					echo "cd to '$d' from history : $i" >> $HOME/.zsh_cd_history
-					reset_prompt "$owd"
+	reset_prompt "$owd" "$d"
+}
+
+set_other_id_path(){
+	local direction="$1"
+	while true; do
+		for e in ${hist_dir_arr[@]};do
+			if [ "$e" = "$id_path" ];then
+				if [ "$direction" = "left" ]; then
+					hist="${other_id_path_prev[$hist]}"
 				else
-					reset_prompt "$owd" "$d"
+					hist="${other_id_path_next[$hist]}"
 				fi
-				return
-			fi
-			i="${other_id_path_prev[$i]}"
-			if [ -z "$i" ]; then
-				break
+				if [ -z "$hist" ]; then
+					return 1
+				fi
+				id_path=$(hist_id_path $hist)
+				continue 2
 			fi
 		done
-	else
-		hist_dir_arr_idx=$((hist_dir_arr_idx + 1))
-		local d="${hist_dir_arr[$hist_dir_arr_idx]}"
-		if [ -d "$d" -a -x "$d" ]; then
-			cd "$d"
-			echo "cd to '$d' from hist_dir_arr : $hist_dir_arr_idx" >> $HOME/.zsh_cd_history
-			reset_prompt "$owd"
+		return 0
+	done
+}
+
+
+hist-dir-only(){
+	to_global
+	local direction="$1"
+	local hist=$HISTNO
+	local id_path="$(hist_id_path $hist)"
+	local owd_id_path="$id_path"
+	if [ ${#hist_dir_arr[@]} -eq 0 ];then
+		hist_dir_arr_idx=1
+		hist_dir_arr+=("$id_path")
+		hist_dir_histno_arr+=("$hist")
+	fi
+	if [ "$direction" = "left" ]; then
+		if (( ${#hist_dir_arr[@]} <= hist_dir_arr_idx ));then
+			if ! set_other_id_path $direction; then
+				return
+			fi
+			hist_dir_arr+=("$id_path")
+			hist_dir_histno_arr+=("$hist")
+			hist_dir_arr_idx=${#hist_dir_arr[@]}
 		else
-			reset_prompt "$owd" "$d"
+			hist_dir_arr_idx=$((hist_dir_arr_idx + 1))
+			id_path="${hist_dir_arr[$hist_dir_arr_idx]}"
+		fi
+	else
+		if (( hist_dir_arr_idx == 1 ));then
+			if ! set_other_id_path $direction; then
+				return
+			fi
+			hist_dir_arr=("$id_path" ${hist_dir_arr[@]})
+			hist_dir_histno_arr=("$hist" ${hist_dir_histno_arr[@]})
+			hist_dir_arr_idx=1
+		else
+			hist_dir_arr_idx=$((hist_dir_arr_idx - 1))
+			id_path="${hist_dir_arr[$hist_dir_arr_idx]}"
 		fi
 	fi
+	hist-dir-only-cd "hist_dir_arr : $hist_dir_arr_idx (${hist_dir_arr[$hist_dir_arr_idx]})"
+}
+	
 
+hist-dir-only-left(){
+	hist-dir-only left
 }
 
 hist-dir-only-right(){
-	local i=$HISTNO
-	local owd=$(hist_dir $i)
-	hist_last=$((`fc -l -1 | head -1 | awk '{print $1}'` + 1))
-	if [ ${#hist_dir_arr[@]} -eq 0 ];then
-		hist_dir_arr_idx=1
-		if [ -n "$owd" ];then
-			hist_dir_arr+=("$owd")
-		else
-			hist_dir_arr+=("$PWD")
-		fi
-		hist_dir_histno_arr+=("$i")
-	fi
-	if (( hist_dir_arr_idx == 1 ));then
-		while ((i <= hist_last));do
-			local d=$(hist_dir $i)
-			if [ -n "$d" ] && [ "$d" != "$owd" ];then
-				for e in ${hist_dir_arr[@]};do
-					if [ "$e" = "$d" ];then
-						i=${other_id_path_next[$i]}
-						if [ -z "$i" ]; then
-							break 2
-						fi
-						continue 2
-					fi
-				done
-				hist_dir_arr=("$d" ${hist_dir_arr[@]})
-				hist_dir_histno_arr=("$i" ${hist_dir_histno_arr[@]})
-				hist_dir_arr_idx=1
-				if [ -d "$d" -a -x "$d" ]; then
-					cd "$d"
-					echo "cd to '$d' from history : $i" >> $HOME/.zsh_cd_history
-					reset_prompt "$owd"
-				else
-					reset_prompt "$owd" "$d"
-				fi
-				return
-			fi
-			i="${other_id_path_next[$i]}"
-			if [ -z "$i" ]; then
-				break
-			fi
-		done
-	elif (( hist_dir_arr_idx > 1 ));then
-		hist_dir_arr_idx=$((hist_dir_arr_idx - 1))
-		local d="${hist_dir_arr[$hist_dir_arr_idx]}"
-		if [ -d "$d" -a -x "$d" ]; then
-			cd "$d"
-			echo "cd to '$d' from hist_dir_arr : $hist_dir_arr_idx (${hist_dir_arr[$hist_dir_arr_idx]})" >> $HOME/.zsh_cd_history
-			reset_prompt "$owd"
-		else
-			reset_prompt "$owd" "$d"
-		fi
-	fi
+	hist-dir-only right
+}
+
+keyseq(){
+	local keyname="$1"
+	_keyseq "$keyname"
+	echo -n "$_keyseq"
 }
 
 zle -N show_warning_buffer
 
 zle -N hist-dir-only-left
-bindkey '^[[1;3D' hist-dir-only-left
+bindkey "$(keyseq alt-left)" hist-dir-only-left
 zle -N hist-dir-only-right
-bindkey '^[[1;3C' hist-dir-only-right
+bindkey "$(keyseq alt-right)" hist-dir-only-right
 
-hist-dir-fix-up(){
-	h_resume_d
-	local i=$HISTNO
-	local owd="$(hist_dir $i)"
-	if [ -z "$owd" ];then
-		owd="$PWD"
+typeset -A widget_name_to_direction=(
+	beginning-of-history backward
+	beginning-of-buffer-or-history backward
+	end-of-history forward
+	end-of-buffer-or-history forward
+)
+
+widget_name_to_direction(){
+	direc="${widget_name_to_direction[$1]}"
+	if [ -n "$direc" ]; then
+		echo -n "$direc"
+	elif [[ "$1" == *forward* ]]; then
+		echo -n "forward"
+	elif [[ "$1" == *down* ]]; then
+		echo -n "forward"
+	else
+		echo -n "backward"
 	fi
-	i=$((i - 1))
-	d=
-	while ((i > 0));do
-		local d=
-		if [ -n "${history[$i]}" ]; then
-			d="$(hist_dir $i)"
-			if [ -n "$d" ] && [ "$d" = "$owd" ];then
-				HISTNO=$i
-				BUFFER="${history[$HISTNO]}"
-				remove_extra_data_from_buffer
-				return
-			fi
+}
+
+bindkey_initialblobald=
+
+get_bind_keyseq_for(){
+	if [ -z "$bindkey_initialized" ]; then
+		bindkey -M emacs > $BINDKEY_PATH
+		initialize_bindkey_data $BINDKEY_PATH
+		bindkey_initialized=1
+	fi
+	_get_bind_keyseq_for "$1"
+	echo -n $_get_bind_keyseq_for
+}
+
+alt_keyseq(){
+	_alt_keyseq "$@"
+	echo -n "$_alt_keyseq"
+}
+
+
+co_bind_with_or_without_alt(){
+	local w=
+	for w in "${co_bind_with_or_without_alt[@]}"; do
+		direc=$(widget_name_to_direction "$w")
+		local cd_code=
+		if [[ "${w[-1]}" == "*" ]]; then
+			w="${w%*}"
+		else
+			cd_code="
+				if [ \"\$HISTNO\" != \"\$i\" ]; then
+					hist_dir_arr_reset
+					hist_cd $direc
+				fi
+			"
 		fi
-		i=$((i - 1))
+		eval "
+			$w-global() {
+				emulate -L zsh
+				local i=\"\$HISTNO\"
+				to_global
+				zle .$w   # 元の動作
+				$cd_code
+			}
+			$w-local() {
+				to_local
+				zle .$w   # 元の動作
+			}
+	"
+		zle -N $w $w-$no_alt_gl
+		zle -N $w-$alt_gl
+		local keyseq=($(get_bind_keyseq_for "$w"))
+		local ks=
+		local alt_keyseq=($(alt_keyseq "${keyseq[@]}"))
+		local aks=
+		for aks in "${alt_keyseq[@]}"; do
+			bindkey "$aks" $w-$alt_gl
+		done
 	done
-	remove_extra_data_from_buffer
-}
-hist-dir-fix-down(){
-	h_resume_d
-	local i=$HISTNO
-	local owd="$(hist_dir $i)"
-	i=$((i + 1))
-	hist_last=$((`fc -l -1 | head -1 | awk '{print $1}'` + 1))
-	while ((i <= hist_last));do
-		if [ -n "${history[$i]}" ]; then
-			local d="$(hist_dir $i)"
-			if [ -n "$d" ] && [ "$d" = "$owd" ];then
-				HISTNO=$i
-				BUFFER="${history[$HISTNO]}"
-				remove_extra_data_from_buffer
-				return
-			fi
-		fi
-		i=$((i + 1))
-	done
-	remove_extra_data_from_buffer
 }
 
-zle -N hist-dir-fix-up
-bindkey '^[[1;3A' hist-dir-fix-up
-zle -N hist-dir-fix-down
-bindkey '^[[1;3B' hist-dir-fix-down
+gl_mode=global
 
-zle -N history-beginning-search-backward-end history-beginning-search-backward-end-pwd
-zle -N history-beginning-search-forward-end history-beginning-search-forward-end-pwd
-zle -N up-line-or-history up-line-or-history-hook
-zle -N down-line-or-history down-line-or-history-hook
-
-beginning-of-history-hook() {
-  	emulate -L zsh
-  	h_resume_d
-  	zle .beginning-of-history   # 元の動作
-  	h_set_cd
+set_fc() {
+	if [ "$gl_mode" = "$2" ]; then
+		return
+	fi
+	local utcmd="$(histno_to_utcmd $1 $HISTNO)"
+	gl_mode=$2
+	if [ "$gl_mode" = "local" ]; then
+		fc -p "./.zsh_history.local" 2>/dev/null
+		fc -l -t '%s' 1 > "$FC_PATH" 2>/dev/null
+		read_local_fc
+	else
+		fc -P 2>/dev/null
+	fi
+	HISTNO="$(utcmd_to_histno $2 $HISTNO)"
 }
 
-zle -N beginning-of-history beginning-of-history-hook
-
-end-of-history-hook() {
-  	emulate -L zsh
-  	h_resume_d
-  	zle .end-of-history   # 元の動作
-  	h_set_cd
+to_local() {
+	set_fc global local
 }
 
-zle -N end-of-history end-of-history-hook
+to_global() {
+	set_fc local global
+}
+
 
 setopt EXTENDED_GLOB
 
-expand-history-hook() {
-	emulate -L zsh
-	local before="$BUFFER"
+co_bind_with_or_without_alt=(
+	history-beginning-search-backward-end
+	history-beginning-search-forward-end
+	up-line-or-history
+	down-line-or-history
+	beginning-of-history
+	end-of-history
+	accept-line-and-down-history
+	beginning-of-buffer-or-history
+	end-of-buffer-or-history
+	history-search-backward
+	history-search-forward
+	beginning-of-line-hist
+	end-of-line-hist
+	up-line-or-search
+	down-line-or-search
+	history-incremental-pattern-search-backward*
+	history-incremental-pattern-search-forward*
+	history-incremental-search-backward*
+	history-incremental-search-forward*
+)
+co_bind_with_or_without_alt
 
-	zle .expand-history   # 元の展開を実行
 
-	local pat=$';༄༅ [^𖡄]#𖡄[0-9](#c20)'
-	BUFFER="${BUFFER//$~pat/}"
+accept-line-and-down-history-global() {
+	to_global
+   zle .accept-line-and-down-history
+	typeset -g FOR_HIST_CD_IN_PRECMD="${histno_next[$HISTNO]} forward"
 }
 
-zle -N expand-history expand-history-hook
-
-accept-line-and-down-history-hook() {
-  emulate -L zsh
-  local src="$BUFFER"
-
-  if zle_acceptable "$src"; then
-    # 完成構文: ここで加工や付加情報を入れてから本来動作
-    zle .accept-line-and-down-history
-	h_set_cd
-  else
-    # 未完成構文: 継続入力側へ
-    zle .accept-line
-  fi
+up-line-or-history-global(){
+	to_global
+	zle .up-line-or-history
+	if [ -z "$up_key_pressed" ]; then
+		up_key_pressed=1
+		HISTNO=$((HISTNO - 1))
+	fi
+	hist_cd backward
 }
-zle -N accept-line-and-down-history accept-line-and-down-history-hook
+
+
+up-line-or-history-local(){
+	to_local
+	zle .up-line-or-history
+	if [ -z "$up_key_pressed" ]; then
+		up_key_pressed=1
+		HISTNO=$((HISTNO - 1))
+	fi
+}
+
+zle-isearch-update() {
+	if [ "$gl_mode" = "global" ]; then
+		hist_cd
+	fi
+}
+
+zle -N zle-isearch-update
+
 
 def_ruby '
 	require "shellwords"
@@ -729,19 +793,6 @@ else
 	_correct_opt_cmd="unsetopt CORRECT"
 fi
 
-create_suffix(){
-	echo -n ";$CMD_MDATA_START $1"
-}
-get_suffix(){
-	local entry="$1"
-	local prefix=";$CMD_MDATA_START "
-	if [[ "$entry" != *"$prefix"* ]]; then
-		echo -n ""
-		return
-	fi
-	local data="${entry#*"$prefix"}"
-	echo -n "$data"
-}
 
 
 function _raw_cmd_line {
@@ -755,43 +806,28 @@ function _raw_cmd_line {
 	fi
 	ALL_BUFFER="$ALL_BUFFER
 $BUFFER"
+	#if zle_acceptable "$ALL_BUFFER"; then
+	#	# 完成構文: ここで加工や付加情報を入れてから本来動作
+	#	BUFFER="$ALL_BUFFER"
+	#else
+	#	# 未完成構文: 継続入力側へ
+	#	BUFFER="$ALL_BUFFER"
+	#fi
 	if zle_acceptable "$ALL_BUFFER"; then
-		# 完成構文: ここで加工や付加情報を入れてから本来動作
-		BUFFER="$ALL_BUFFER"
-	else
-		# 未完成構文: 継続入力側へ
-		BUFFER="$ALL_BUFFER"
+		echo -ne '\e7'
+		echo -ne "\033[999C"
+		echo -ne "\033[8D"
+		echo -ne "\033[34m"
+		date=`date +"%k:%M:%S"`
+		echo -ne $date
+		echo -ne "\033[0m"
+		echo -ne '\e8'
+		exec 1>&1
+		echo "`date +"%Y-%m-%d %H:%M:%S"` $ALL_BUFFER" >> $HOME/.zsh_raw_cmd_lines
 	fi
-	echo -ne '\e7'
-	echo -ne "\033[999C"
-	echo -ne "\033[8D"
-	echo -ne "\033[34m"
-	date=`date +"%k:%M:%S"`
-	echo -ne $date
-	echo -ne "\033[0m"
-	echo -ne '\e8'
-	exec 1>&1
-	echo "`date +"%Y-%m-%d %H:%M:%S"` $ALL_BUFFER" >> $HOME/.zsh_raw_cmd_lines
 	zle accept-line
 }
 
-remove_extra_data_from_buffer(){
-	local PRE_BUFFER="$BUFFER"
-	local cleaned_buffer="$BUFFER"
-	while [[ "$cleaned_buffer" == *"$CMD_SECRET_BYTE_PREFIX"*"; ;"* ]]; do
-		local left_part="${cleaned_buffer%%"$CMD_SECRET_BYTE_PREFIX"*}"
-		local rest_part="${cleaned_buffer#*"$CMD_SECRET_BYTE_PREFIX"}"
-		rest_part="${rest_part#*"; ;"}"
-		cleaned_buffer="${left_part}${rest_part}"
-	done
-	BUFFER="$cleaned_buffer"
-	dbv $BUFFER
-	dbv $CMD_MDATA_BYTE_PREFIX
-	dbv "${BUFFER%"$CMD_MDATA_BYTE_PREFIX"*}"
-	dbv "${BUFFER%%"$CMD_MDATA_BYTE_PREFIX"*}"
-	BUFFER="${BUFFER%%"$CMD_MDATA_BYTE_PREFIX"*}"
-	dbv $BUFFER
-}
 
 zle -N raw_cmd_line_widget _raw_cmd_line
 bindkey '^J' raw_cmd_line_widget
@@ -804,7 +840,6 @@ bindkey '^M' raw_cmd_line_widget
 zsh_history_hook() {
 	emulate -L zsh
 	local line="${1%$'\n'}"   # 末尾改行を外す
-
 	[[ $options[histignorespace] == on ]] && [[ "$line" == ' '* ]] && return 1
 
 	if [[ -z ${line//[[:space:]]/} ]]; then
@@ -828,7 +863,7 @@ hist(){
 			asterisk=1
 		fi
 		if [[ $key =~ '^[0-9]+(\*|)$' ]]; then
-			dir=$(hist_dir $key)
+			dir=$(hist_id_path $key)
 			kmax=$(( ${#key} > kmax ? ${#key} : kmax ))
 			dir=$(tilderize_path "$dir")
 			dmax=$(( ${#dir} > dmax ? ${#dir} : dmax ))
@@ -847,7 +882,7 @@ hist(){
 		fi
 		if [[ $key =~ '^[0-9]+(\*|)$' ]]; then
 			val="${line#*  }"
-			dir=$(hist_dir $key)
+			dir=$(hist_id_path $key)
 			if [ -n "$dir" ]; then
 				lpadd=$(( kmax - ${#key} ))
 				lspaces=$(printf '%*s' "$lpadd" '')

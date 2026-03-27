@@ -4,5 +4,5 @@
 
 depends zsh_wrap yk_support_for_sh
 
-install zsh_dir_hist.zsh /etc/zshrc.d
+install zsh_dir_hist.zsh zsh_dir_hist_support keymap.data /etc/zshrc.d
 install zle_acceptable

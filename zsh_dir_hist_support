@@ -1,0 +1,671 @@
+#!/bin/env ruby
+
+require __dir__ + "/bkey"
+
+
+HistNo2Cmd = {}
+HistNo2UtCmd = {}
+HistNo2Ut = {}
+HistNo2Pwd = {}
+HistNo2Sid = {}
+UtCmd2Sid = {}
+OtherPwdSameCmdNext = {}
+OtherPwdSameCmdPrev = {}
+OtherSidSameCmdNext = {}
+OtherSidSameCmdPrev = {}
+Cmd2Histno = {}
+HistNoList = []
+SameDirCmdNext = {}
+SameDirCmdPrev = {}
+OtherDirNext = {}
+OtherDirPrev = {}
+SID = ""
+
+BYTE_PUA_BASE = 0x10FFE00
+BYTE_PUA_LAST = BYTE_PUA_BASE + 0xFF
+
+def encode_byte_to_u10ffe str
+	bytes = String(str).b.bytes
+	bytes.map { |value| [BYTE_PUA_BASE + value].pack("U") }.join
+end
+
+def decode_byte_from_u10ffe str
+	encoded = String(str)
+	decoded_bytes = encoded.each_codepoint.map do |cp|
+		raise ArgumentError, "char out of range: U+#{cp.to_s(16).upcase}" if cp < BYTE_PUA_BASE || cp > BYTE_PUA_LAST
+		cp - BYTE_PUA_BASE
+	end
+	decoded_bytes.pack("C*").force_encoding(Encoding::BINARY)
+end
+
+def snake_to_camel str, lower: false
+	parts = String(str).split('_').reject(&:empty?)
+	camel = parts.map { |part| part[0] ? part[0].upcase + part[1..].to_s.downcase : "" }.join
+	lower ? camel.sub(/\A[A-Z]/) { |c| c.downcase } : camel
+end
+
+def camel_to_snake str
+	String(str)
+		.gsub(/::/, '/')
+		.gsub(/([A-Z]+)([A-Z][a-z])/, '\\1_\\2')
+		.gsub(/([a-z\d])([A-Z])/, '\\1_\\2')
+		.tr('-', '_')
+		.downcase
+end
+
+class IdentPath
+	List = {}
+	attr_reader :path, :real_dev, :real_inode, :real_ctime, :id
+	def initialize path
+		@path = File.expand_path path
+		@real_dev, @real_inode, @real_ctime = self.class.getRealInfo @path
+		key = [@path, @real_dev, @real_inode, @real_ctime]
+		if List.key? key
+			yield List[key]
+		else
+			List[key] = self
+			@id = List.size
+			yield self
+		end
+	end
+	def norm
+		key = [@path, @real_dev, @real_inode, @real_ctime]
+		if List.key? key
+			return List[key]
+		else
+			List[key] = self
+			@id = List.size
+			return self
+		end
+	end
+	def self.emerge path
+		if path.is_a? IdentPath
+			return path.norm
+		else
+			new path do |emerged|
+				return emerged
+			end
+		end
+	end
+	def self.getRealInfo path
+		real = File.realpath(File.expand_path(path)) rescue nil
+		if real
+			realStat = File.stat(real) rescue nil
+			if realStat
+				return realStat.dev, realStat.ino, realStat.ctime
+			end
+		end
+		return nil, nil, nil
+	end
+	def status_msg
+		return case
+		when !File.exist?(@path)
+			"Directory, '#{@path}' not found"
+		when self.class.getRealInfo(@path) != [@real_dev, @real_inode, @real_ctime]
+			"Directory, '#{@path}' has been recreated since last execution of the command"
+		else
+			""
+		end
+	end
+	def to_s
+		return @id.to_s + @path
+	end
+	def self.[] id
+		List[id.to_i - 1]
+	end
+	def == other
+		self.to_s == other.to_s
+	end
+end
+
+def encode_mdata id_path, sid
+	marr = [id_path, sid]
+	mdumped = Marshal.dump marr
+	encoded = encode_byte_to_u10ffe mdumped
+	"#{MDATA_START}#{encoded}"
+end
+
+def decode_mdata buff
+	if buff.start_with? MDATA_START
+		encoded = buff[MDATA_START.size..-1]
+		mdumped = decode_byte_from_u10ffe encoded
+		marr = Marshal.load mdumped
+		marr[0] = marr[0].norm # normalize the IdentPath object
+		return marr[0].norm, marr[1]
+	end
+	return nil, nil
+end
+
+def do_zsh_dir_hist_init pwd, sid, fc_path, src_path, info_path, hist_file
+	HistEntry.init pwd, sid, fc_path, src_path, info_path
+end
+
+
+def do_zsh_dir_hist_update cpwd, ref_epochseconds, prev_cmd, new_histno
+	HistEntry.analFC cpwd, SID, ref_epochseconds, prev_cmd, new_histno
+end
+
+def do_zsh_dir_hist_dir_msg histno
+	List[histno.to_i]&.id_path&.status_msg || ""
+end
+
+def do_get_id_path_from_dir dir
+	IdentPath.emerge(dir).to_s
+end
+
+BindKeyData = {}
+
+def do_initialize_bindkey_data bindkey_path
+	bindkey_path = File.expand_path(bindkey_path)
+	if File.exist? bindkey_path
+		File.open bindkey_path do |f|
+			f.each_line do |line|
+				if line =~ /^\s*"(.*?)"\s+"(.*?)"/
+					keyseq = $1
+					widget = $2
+					BindKeyData[keyseq] = widget
+					(BindKeyData[widget] ||= []).push keyseq
+				end
+			end
+		end
+	else
+		STDERR.puts "Warning: bindkey data file '#{bindkey_path}' not found. Bind key sequence for alt key combinations will not be available."
+	end
+end
+
+def do_get_bind_keyseq_for widget
+	BindKeyData[widget].join(" ") || ""
+end
+
+class Key
+	List = {}
+	attr_reader :seq
+	require 'set'
+	def initialize nameSet, seq
+		@nameSet = nameSet
+		@seq = seq
+		List[@nameSet] = self
+		(List[seq] ||= []).push self
+	end
+	def self.emerge name: nil, seq: nil
+		if name
+			nameSet = Set.new *name.split("-").map{_1.downcase}
+			if seq
+				if List[nameSet]
+					raise ArgumentError, "Inconsistent key data: name '#{name}' and sequence '#{seq}' correspond to different keys."
+				end
+				return List[nameSet] = new(nameSet, seq)
+			end
+			if List.key?(nameSet)
+				return List[nameSet]
+			else
+				return nil
+			end
+		end
+		if seq
+			return List[seq]
+		end
+		return nil
+	end
+	def name
+		@nameSet.to_a.join("-")
+	end
+	def alt
+		if @nameSet.include? "alt"
+			return nil
+		end
+		altNameSet = @nameSet.dup
+		altNameSet.add "alt"
+		return List[altNameSet]
+	end
+end
+
+def initialize_keyname_to_keyseq_data
+	d = File.expand_path(__dir__)
+	File.open File.expand_path("#{d}/keymap.data") do |f|
+		f.each_line do |line|
+			if line !~ /^(\s+|#)/
+				arr = line.split
+				keyname = arr[0]
+				keyseq = arr[1]
+				Key.emerge(name: keyname, seq: keyseq)
+			end
+		end
+	end
+end
+
+initialize_keyname_to_keyseq_data
+
+def do_alt_keyseq *keyseqs
+	ret = []
+	arr = Key.emerge(seq: keyseq)
+	if arr
+		arr.each do |key|
+		  	a = key.alt
+		  	if a
+				ret << a.seq
+			end
+		end
+	end
+	return ret.join(" ")
+end
+def do_keyseq keyname
+	Key.emerge(name: keyname)&.seq || ""
+end
+def do_keyname keyseq
+	Key.emerge(seq: keyseq)&.map{_1.name}.join(" ") || ""
+end
+
+
+DECLARED_TYPESET = {}
+
+def maybe_typeset_A varName
+	if !DECLARED_TYPESET[varName]
+		DECLARED_TYPESET[varName] = true
+		"typeset -A #{varName}"
+	else
+		"#{varName}+"
+	end
+end
+
+class HistEntry
+	attr_reader :histno, :ut, :cmd, :id_path, :sid, :next, :prev
+	List = {}
+	SortedList = []
+	FCLineData = Struct.new *%I{serial histno ut cmd id_path sid}
+	UtCmd2FCLineDataInMetaDataFile = {}
+	def initialize fcLineData = nil, **kwargs
+		if fcLineData
+			@histno, @ut, @cmd, @id_path, @sid = fcLineData.values_at(:histno, :ut, :cmd, :id_path, :sid)
+			List[histno] = self
+			if SortedList.empty? || @histno > SortedList.last&.histno
+				SortedList << self
+				@prev = SortedList[-2]
+				@prev.setNext self if @prev
+				@next = nil
+			else
+				STDERR.puts "Warning: histno #{@histno} is not greater than the last histno in SortedList. Inserting it in the correct position."
+				i = SortedList.bsearch_index { |x| x.histno >= @histno } || SortedList.length
+				SortedList.insert i, self
+			end
+		else
+			@histno = 0
+			@id_path = IdentPath.emerge(kwargs[:id_path]) if kwargs[:id_path]
+			@sid = kwargs[:sid]
+		end
+	end
+	def isDummy?
+		@histno == 0
+	end
+	def <=> other
+		self.histno <=> other.histno
+	end
+	def fcLine
+		":#{@ut}:0;#{@cmd}"
+	end
+	def fcLineWithMData
+		":#{@ut}:0;#{@cmd}#{encode_mdata @id_path, @sid}"
+	end
+	def setNext nextEntry
+		@next = nextEntry
+	end
+	def setPrev prevEntry
+		@prev = prevEntry
+	end
+
+	BaseMetaDataFilePath = File.expand_path('~/.zsh_history_with_metadata')
+
+	def self.processMetaDataFile path = BaseMetaDataFilePath, truncate = nil
+		path = File.expand_path(path)
+		File.open path, "r+" do |f|
+			f.lock File::LOCK_EX do
+				ptmp = "#{path}.under_processing"
+				if File.exist? ptmp
+					f.truncate 0
+					f.write File.read(ptmp)
+					f.flush
+					FileUtils.rm ptmp, force: true
+					f.seek 0, IO::SEEK_SET
+				end
+				lno = 0
+				f.each_line do |line|
+					if line =~ /^:\s*(\d+):\d+;(.*?)(#{MDATA_START}[^\n]*)/m
+						ut = $1.to_i
+						cmd = $2
+						mdata = $3
+						cmd.gsub! /\\\n/, '\n'
+						utcmd = "#{ut}  #{cmd}"
+						id_path, sid = decode_mdata mdata
+						UtCmd2FCLineDataInMetaDataFile[utcmd] = FCLineData.new(-lno, nil, ut, cmd, id_path, sid)
+					end
+					lno += 1
+				end
+				if truncate
+					f.truncate 0
+				end
+			end
+		end
+	end
+	SID = ""
+	FC_PATH = ""
+	SRC_PATH = ""
+	INFO_PATH = ""
+	def self.init pwd, sid, fc_path, src_path, info_path
+		SID.replace sid
+		FC_PATH.replace fc_path
+		SRC_PATH.replace src_path
+		INFO_PATH.replace info_path
+		analFC pwd, SID
+		@@initialized = true
+	end
+	
+	def self.analFC cpwd, csid, ref_epochseconds = nil, ref_prev_cmd = nil, new_histno = nil
+		# initialize: cpwd = nil
+		# update: cpwd = current cpwd, ref_epochseconds = epochseconds of the command to update, ref_prev_cmd = the command to update
+		# missing: mode = cpwd = ""
+		if !ref_epochseconds
+			processMetaDataFile 
+		else
+			processMetaDataFile "#{info_path}/zsh_history_with_metadata.update", :truncate
+		end
+		data_arr = []
+		serial = 0
+		File.open FC_PATH do |f|
+			f.each_line do |line|
+				if line =~ /^\s*(\d+)(\*\s*|\s+)((\d+)\s+(.+))/
+					histno = $1.to_i
+					ut = $4.to_i
+					cmd = $5
+					utcmd = "#{ut}  #{cmd}"
+					d = UtCmd2FCLineDataInMetaDataFile[utcmd]
+					if d
+						id_path, sid = d.values_at :id_path, :sid
+						d.serial = -1 - d.serial # used
+					end
+					data_arr << FCLineData.new(serial, histno, ut, cmd, id_path, sid)
+					serial += 1
+				end
+			end
+		end
+		if !ref_epochseconds
+			rmIdx = UtCmd2FCLineDataInMetaDataFile.values.select{_1.serial >= 0}.map{_1.serial}
+			if !rmIdx.empty?
+				File.open BaseMetaDataFilePath, "r+" do |f|
+					f.lock File::LOCK_EX do
+						FileUtils.cp BaseMetaDataFilePath, "#{BaseMetaDataFilePath}.under_processing"
+						lines = f.each_line.to_a
+						f.rewind
+						f.truncate 0
+						lines.each_with_index do |line, i|
+							f.puts line unless rmIdx.include?(i)
+						end
+						f.flush
+						FileUtils.mv "#{BaseMetaDataFilePath}.under_processing", "#{BaseMetaDataFilePath}.bak", force: true
+					end
+				end
+			end
+		end
+		new_cmd_data = data_arr.
+			select{ _1.cmd == ref_prev_cmd }.
+			min_by{ (_1.ut - ref_epochseconds).abs } if ref_prev_cmd && ref_epochseconds
+
+		data_arr.each do |fcLineData|
+			if fcLineData == new_cmd_data
+				new_cmd_data.id_path = IdentPath.emerge(cpwd)
+				new_cmd_data.sid = SID
+				n = HistEntry.emerge new_cmd_data
+				newFCLine = n.fcLineWithMData # ":#{ut}:0;#{cmd}#{encode_mdata @id_path, SID}"
+				File.open File.expand_path('~/.zsh_history_with_metadata'), "a" do |f|
+					f.lock File::LOCK_EX do
+						f.seek 0, IO::SEEK_END
+						f.puts newFCLine
+					end
+				end
+				File.open File.expand_path("#{n.id_path.path}/.zsh_history.local"), "a" do |f|
+					f.lock File::LOCK_EX do
+						f.seek 0, IO::SEEK_END
+						f.puts n.fcLine
+					end
+				end
+				Dir.glob INFO_PATH + "/../*" do |d|
+					d = File.expand_path d
+					if d != INFO_PATH
+						File.open "#{d}/zsh_history_with_metadata.update", "a" do |f|
+							f.lock File::LOCK_EX do
+								f.seek 0, IO::SEEK_END
+								f.puts n.fcLineWithMData
+							end
+						end
+					end
+				end
+			else
+				HistEntry.emerge fcLineData
+			end
+		end
+		updateLinks IdentPath.emerge(cpwd), SID
+	end
+	def self.emerge fcLine
+		if List[fcLine.histno]
+			return List[fcLine.histno]
+		else
+			ret = new fcLine
+			yield ret if block_given?
+			return ret
+		end
+	end
+	# -------------- produce source ------------------
+	PrevNextProp = [:sid, :id_path]
+	@@last_volatile_item_prev = nil
+	codeForEachPropBeforeLoop = ""
+	codeForEachPropAfterLoop = ""
+	codeForEachPropInLoop = ""
+	codeForEachPropInReverseLoop = ""
+	codeForClass = ""
+	codeForDownload = ""
+	codeForFinalize = ""
+	PrevNextProp.each do |prop|
+		%w[ other nil
+		    same  {}
+		].each_slice 2 do |so, init|
+			codeForClass << %{
+				@@#{so}_#{prop}_next_is_volatile_list = {}
+				@@#{so}_#{prop}_prev_holder = #{init}
+				@@download_list_for_#{so}_#{prop}_next = []
+			}
+		end
+		codeForEachPropBeforeLoop << %{
+			other_#{prop}_prev_holder = @@other_#{prop}_prev_holder
+			same_#{prop}_prev_holder = @@same_#{prop}_prev_holder
+			other_#{prop}_next_holder = nil
+			same_#{prop}_next_holder = {}
+			@@download_list_for_same_#{prop}_next.clear
+			@@download_list_for_other_#{prop}_next.clear
+			other_#{prop}_next_is_volatile_list = {}
+			same_#{prop}_next_is_volatile_list = {}
+		} + (prop == "id_path" ? %{
+			cur_last_volatile_item = nil
+			started = true
+		} : "") + %{
+			next_#{prop}_proxy = HistEntry.new #{prop}: #{prop} # dummy
+			SortedList.reverse_each do |item|
+				if item == @@last_volatile_item_prev
+					break
+				end
+		} + (prop == "id_path" ? %{
+				if started
+					if !item.id_path
+						cur_last_volatile_item = item
+					else
+						started = false
+					end
+				end
+		} : "") + %{
+				next_#{prop}_proxy = item.set_proxy_for_#{prop}_in_backward(item.#{prop} ? item : next_#{prop}_proxy)
+			end
+			prev_#{prop}_proxy = next_#{prop}_proxy
+			item = @@last_volatile_item_prev&.next || SortedList.first
+			while item
+				prev_#{prop}_proxy = item.set_proxy_for_#{prop}_in_forward(item.#{prop} ? item : prev_#{prop}_proxy)
+				item = item.next
+			end
+		}
+		codeForEachPropInLoop << %{
+			if next == cur_last_volatile_item
+				@@same_#{prop}_prev_holder = same_#{prop}_prev_holder.clone
+				@@other_#{prop}_prev_holder = other_#{prop}_prev_holder
+			end
+		}
+		[	%W{backward next prev} << codeForEachPropInLoop,
+		 	%W{forward prev next} << codeForEachPropInReverseLoop
+		].each do |bf, np, pn, code|
+			code << %{
+				#{pn}_#{prop} = #{pn}.proxy_for_#{prop}_in_#{bf}.#{prop}
+				#{np}_#{prop} = #{np}.proxy_for_#{prop}_in_#{bf}.#{prop}
+				if #{pn}_#{prop} == #{np}_#{prop}
+					#{np}.set_other_#{prop}_#{pn} other_#{prop}_#{pn}_holder
+					#{np}.set_same_#{prop}_#{pn} #{pn}
+					same_#{prop}_#{pn}_holder[#{np}_#{prop}] = #{np}
+				else
+					#{np}.set_same_#{prop}_#{pn} same_#{prop}_#{pn}_holder[#{np}_#{prop}]
+					#{np}.set_other_#{prop}_#{pn} #{pn}
+					other_#{prop}_#{pn}_holder = #{pn}
+				end
+			}
+		end
+		%{same other}.each do |so|
+			codeForEachPropInReverseLoop << %{
+				if prev.#{so}_#{prop}_next_is_volatile
+					#{so}_#{prop}_next_is_volatile_list[prev] = true
+				else
+					#{so}_#{prop}_next_is_volatile_list.delete prev
+				end
+			}
+		end
+		%w[same other].zip ["[item.#{prop}]", ""] do |so, subsc|
+			codeForEachPropAfterLoop << %{
+				@@#{so}_#{prop}_next_is_volatile_list.each_key do |item|
+					item.set_#{so}_#{prop}_next #{so}_#{prop}_next_holder#{subsc} do
+						@@download_list_for_#{so}_#{prop}_next << item
+					end
+					if !item.#{so}_#{prop}_next_is_volatile
+						@@#{so}_#{prop}_next_is_volatile_list.delete item
+					end
+				end
+				@@#{so}_#{prop}_next_is_volatile_list.merge! #{so}_#{prop}_next_is_volatile_list
+			}
+		end
+		codeForDownload << %{
+			src << "#{maybe_typeset_A "histno_to_#{prop}"}=(\n"
+			SortedList.reverse_each do |item|
+				if item == @@last_volatile_item_prev
+					break
+				end
+				tmp = item.#{prop}
+				if tmp
+					src << "\t\"\#{item.histno}\"\t\"\#{tmp.to_s}\"\n"
+				end
+			end
+			src << ")\n"
+		}
+		%w[forward backward].each do |fb|
+			codeForDownload << %{
+				src << "#{maybe_typeset_A "histno_to_proxy_for_#{prop}_in_#{fb}"}=(\n"
+				SortedList.reverse_each do |item|
+					if item == @@last_volatile_item_prev
+						break
+					end
+					tmp = item.proxy_for_#{prop}_in_#{fb}
+					if tmp
+						src << "\t\"\#{item.histno}\"\t\"\#{tmp.histno}\"\n"
+					end
+				end
+				src << ")\n"
+			}
+		end
+		%w[same other].product %w[next prev] do |so, np|
+			theme = "#{so}_#{prop}_#{np}"
+			codeForClass << %{
+				def #{theme}
+					@#{theme}
+				end
+				def set_#{theme} arg
+					if @#{theme} != arg
+						@#{theme} = arg
+						yield if block_given?
+					end
+				end
+				def #{theme}_is_volatile
+					!@#{theme} || (@@last_volatile_item_prev.histno < @#{theme}.histno && !@#{theme}.#{prop})
+				end
+			}
+			codeForDownload << %{
+				src << "#{maybe_typeset_A "#{theme}"}=(\n"
+				SortedList.reverse_each do |item|
+					if item == @@last_volatile_item_prev
+						break
+					end
+					tmp = item.#{theme}
+					if tmp
+						src << "\t\#{item.histno}\t\#{tmp.histno}\n"
+					end
+				end
+				src << ")\n"
+			}
+		end
+		%w[same other].each do |so|
+			codeForDownload << %{
+				src << "#{maybe_typeset_A "#{so}_#{prop}_next"}=(\n"
+				@@download_list_for_#{so}_#{prop}_next.each do |item|
+					tmp = item.#{so}_#{prop}_next
+					if tmp
+						src << "\t\#{item.histno}\t\#{tmp.histno}\n"
+					end
+				end
+				src << ")\n"
+			}
+		end
+	end
+	codeForFinalize << %{
+		@@last_volatile_item_prev = cur_last_volatile_item&.prev || SortedList.last
+	}
+	class_eval %{
+		#{codeForClass}
+		def self.updateLinks id_path, sid
+			#{codeForEachPropBeforeLoop}
+			item = @@last_volatile_item_prev || SortedList.first
+			while item&.next
+				prev = item
+				next = item.next
+				#{codeForEachPropInLoop}
+				item = item.next
+			end
+			item = SortedList[-1]
+			while item&.prev
+				next = item
+				prev = item.prev
+				#{codeForEachPropInReverseLoop}
+				if prev == @@last_volatile_item_prev
+					break
+				end
+				item = item.prev
+			end
+			#{codeForEachPropAfterLoop}
+			IO.write SRC_PATH, downloadToSrc
+			#{codeForFinalize}
+		end
+		def self.downloadToSrc
+			src = ""
+			#{codeForDownload}
+			src
+		end
+	}
+end
+
+
+
+
+def do_zsh_dir_hist_init sid, fc_path, src_path, info_path
+	HistEntry.init sid, fc_path, src_path, info_path
+end
+
+

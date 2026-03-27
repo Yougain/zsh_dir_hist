@@ -1,0 +1,252 @@
+#!/bin/env ruby
+
+require 'Yk/debug2'
+
+BindKeyData = {}
+Widgets = {}
+
+#p > /tmp/bindkey_data.debug
+
+def _initialize_bindkey_data i
+	i.each_line do |line|
+		#p line
+		if line =~ /^\s*"([^"]+)"\s+([^\s]+)/
+			keyseq = $1
+			widget = $2
+			#p keyseq, widget
+			BindKeyData[keyseq] = widget
+			(BindKeyData[widget] ||= []).push keyseq
+			Widgets[widget] = true
+		end
+	end
+end
+
+
+def do_initialize_bindkey_data bindkey_path
+	bindkey_path = File.expand_path(bindkey_path)
+	if File.exist? bindkey_path
+		File.open bindkey_path do |f|
+			_initialize_bindkey_data f
+		end
+	else
+		STDERR.puts "Warning: bindkey data file '#{bindkey_path}' not found. Bind key sequence for alt key combinations will not be available."
+	end
+end
+
+def do_get_bind_keyseq_for widget
+	BindKeyData[widget].join(" ") || ""
+end
+
+class Key
+	List = {}
+	attr_reader :seq
+	require 'set'
+	def initialize nameSet, seq
+		@nameSet = nameSet
+		@seq = seq
+		List[@nameSet] = self
+		(List[seq] ||= []).push self
+	end
+	def self.emerge name: nil, seq: nil
+		if name
+			nameSet = Set.new name.split("-").map{_1.downcase}
+			if seq
+				seq = " " if seq == "space"
+				if List[nameSet]
+					raise ArgumentError, "Inconsistent key data: name '#{name}' and sequence '#{seq}' correspond to different keys."
+				end
+				return List[nameSet] = new(nameSet, seq)
+			end
+			if List.key?(nameSet)
+				return List[nameSet]
+			else
+				return nil
+			end
+		end
+		if seq
+			return List[seq]
+		end
+		return nil
+	end
+	def name
+		@nameSet.to_a.sort_by{
+			case _1
+			when "ctrl"
+				1
+			when "alt"
+				0
+			when "numlock_off"
+				-1
+			when "shift"
+				2
+			else
+				3
+			end
+		}.join("-")
+	end
+	def mod *m
+		m.map!{_1.to_s.downcase}
+		altNameSet = @nameSet.clone.add *m
+		return List[altNameSet]
+	end
+end
+
+def initialize_keyname_to_keyseq_data
+	d = File.expand_path(__dir__)
+	File.open File.expand_path("#{d}/keymap.data") do |f|
+		f.each_line do |line|
+			if line !~ /^(\s+|#)/
+				arr = line.split
+				keyname = arr[0]
+				keyseq = arr[1]
+				Key.emerge(name: keyname, seq: keyseq)
+			end
+		end
+	end
+end
+
+initialize_keyname_to_keyseq_data
+
+def _do_mod_keyseq keyseq, *mod
+	ret = ""
+	sers = get_keys(keyseq)
+	sers&.map do |ser|
+		mser = ser.map{ |k| 
+			km = k.mod *mod
+			if !km
+					break nil
+			end
+			km
+		}
+		if mser.nil?
+			next nil
+		end
+		mod_seq_all = ""
+		mser.each do
+			mod_seq_all << _1.seq
+		end
+		if mod_seq_all == keyseq
+			next nil
+		end
+		mod_seq_all
+	end.select{ _1 != nil }
+end
+
+def do_mod_keyseq keyseq_arr, *mod
+	mod_keyseqs = {}
+	keyseq_arr.map{|keyseq|
+		ret = _do_mod_keyseq(keyseq, *mod)
+		ret
+	}.each do |mod_keyseq|
+		if mod_keyseq
+			mod_keyseqs[mod_keyseq] = true
+		end
+	end
+	mod_keyseqs.keys.join(" ")
+end
+
+def do_alt_keyseq *keyseqs
+	do_mod_keyseq keyseqs, "alt"
+end
+
+
+def do_keyseq keyname
+	s = ""
+	keyname.split /\,/ do |kn|
+		k = Key.emerge(name: kn)
+		return nil if !k
+		s += k.seq
+	end
+	s
+end
+
+def get_keys keyseq
+	ks = keyseq
+	#p 1000
+	kn = loop do
+		#p 100
+		k = Key.emerge(seq: ks)
+		if k
+			break k.map{
+				[_1]
+			}
+		else
+			ks = ks[0..-2]
+			if ks.empty?
+				return nil
+			end
+		end
+	end
+	left = keyseq[ks.size..-1]
+	if !left.empty?
+		lk = get_keys(left)
+		if lk
+			ret = []
+			kn.product lk do |a, b|
+				ret << a + b
+			end
+			return ret
+		else
+			return nil
+		end
+	end
+	kn
+end
+def do_keyname keyseq
+	list_of_keys = get_keys keyseq
+	if list_of_keys
+		return list_of_keys.map do |keys|
+			keys.map{_1.name}.join(",")
+		end.join(" ")
+	else
+		return nil
+	end
+end
+
+
+def do_initialize_bindkey_data bindkey_path
+	bindkey_path = File.expand_path(bindkey_path)
+	if File.exist? bindkey_path
+		File.open bindkey_path do |f|
+			_initialize_bindkey_data f
+		end
+	else
+		STDERR.puts "Warning: bindkey data file '#{bindkey_path}' not found. Bind key sequence for alt key combinations will not be available."
+	end
+end
+
+
+
+if File.expand_path($0) == File.expand_path(__FILE__)
+
+	_initialize_bindkey_data STDIN.read
+
+	Widgets.keys.sort.each do |widget|
+		#if widget == "backward-kill-word"
+			#BindKeyData[widget].shift
+			#BindKeyData[widget].pop
+			STDOUT.write "#{widget}: #{BindKeyData[widget]} "
+			BindKeyData[widget].map{|keyseq| 
+				r = do_keyname(keyseq)
+				r
+			}.each do |keyname|
+				STDOUT.write "#{keyname} "
+			end
+			STDOUT.write "\n	alt: "
+			alt_keyseqs = {}
+			res = do_mod_keyseq BindKeyData[widget], "alt"
+			STDOUT.write res, "\t"
+			res.split.map { |keyseq|
+				do_keyname(keyseq)
+			}.each do |keyname|
+				STDOUT.write "#{keyname} "
+			end
+			puts ""
+		#end
+		#puts "key=#{do_keyname(keyseq)} widget=#{widget}" # これでKeyオブジェクトが生成される
+	end
+
+end
+
+
+
